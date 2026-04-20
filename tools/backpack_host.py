@@ -175,17 +175,24 @@ def parse_hex(s: str) -> bytes:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Waybeam TX-Backpack host CLI")
-    ap.add_argument("--port", default="/dev/ttyACM0")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--port", default="/dev/ttyACM0",
+                        help="serial port (default: /dev/ttyACM0)")
+
+    ap = argparse.ArgumentParser(description="Waybeam TX-Backpack host CLI",
+                                 parents=[common])
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    listen = sub.add_parser("listen", help="print inbound frames until Ctrl-C")
+    listen = sub.add_parser("listen", parents=[common],
+                            help="print inbound frames until Ctrl-C")
     listen.add_argument("--duration", type=float, default=None)
 
-    ping = sub.add_parser("ping", help="send PING, wait for PONG")
+    ping = sub.add_parser("ping", parents=[common],
+                          help="send PING, wait for PONG")
     ping.add_argument("--seq", type=int, default=1)
 
-    inject = sub.add_parser("inject", help="send INJECT_ESPNOW to a peer")
+    inject = sub.add_parser("inject", parents=[common],
+                            help="send INJECT_ESPNOW to a peer")
     inject.add_argument("--mac", required=True, type=parse_mac)
     inject.add_argument("--hex", required=True, type=parse_hex)
 
