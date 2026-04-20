@@ -26,6 +26,11 @@
 #include <MAVLink.h>
 #endif
 
+#include "elrs_serial.h"
+#ifdef HOST_USB_CDC
+#include "host_channel.h"
+#endif
+
 /////////// GLOBALS ///////////
 
 uint8_t bindingAddress[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -102,12 +107,12 @@ void ProcessMSPPacketFromPeer(mspPacket_t *packet)
     }
     case MSP_ELRS_BACKPACK_SET_PTR: {
       DBGLN("MSP_ELRS_BACKPACK_SET_PTR...");
-      msp.sendPacket(packet, &Serial);
+      msp.sendPacket(packet, &ELRS_SERIAL);
       break;
     }
     case MSP_SET_VTX_CONFIG: {
       DBGLN("MSP_SET_VTX_CONFIG...");
-      msp.sendPacket(packet, &Serial);
+      msp.sendPacket(packet, &ELRS_SERIAL);
       break;
     }
   }
@@ -120,6 +125,11 @@ void OnDataRecv(uint8_t * mac_addr, uint8_t *data, uint8_t data_len)
 void OnDataRecv(const uint8_t * mac_addr, const uint8_t *data, int data_len)
 #endif
 {
+#ifdef HOST_USB_CDC
+  // Mirror every bound-peer ESP-NOW frame we see to the host. Done before
+  // stock UID filtering because the host is interested in all traffic.
+  waybeam::host_channel_emit_espnow_rx(mac_addr, data, (uint8_t)data_len);
+#endif
   MSP recv_msp;
   DBGLN("ESP NOW DATA:");
   for(int i = 0; i < data_len; i++)
@@ -153,7 +163,7 @@ void SendVersionResponse()
   {
     out.addByte(version[i]);
   }
-  msp.sendPacket(&out, &Serial);
+  msp.sendPacket(&out, &ELRS_SERIAL);
 }
 
 void HandleConfigMsg(mspPacket_t *packet)
@@ -281,14 +291,22 @@ void sendMSPViaEspnow(mspPacket_t *packet)
     return;
   }
 
+  const uint8_t *target;
   if (packet->function == MSP_ELRS_BIND)
   {
+    target = bindingAddress;
     esp_now_send(bindingAddress, (uint8_t *) &nowDataOutput, packetSize); // Send Bind packet with the broadcast address
   }
   else
   {
+    target = firmwareOptions.uid;
     esp_now_send(firmwareOptions.uid, (uint8_t *) &nowDataOutput, packetSize);
   }
+#ifdef HOST_USB_CDC
+  waybeam::host_channel_emit_espnow_tx(target, true, nowDataOutput, packetSize);
+#else
+  (void)target;
+#endif
 
   blinkLED();
 }
@@ -383,8 +401,16 @@ void setup()
   LOGGING_UART.begin(115200);
   LOGGING_UART.setDebugOutput(true);
 #endif
+#ifdef HOST_USB_CDC
+  // Waybeam fork: USB-CDC carries the host channel; ELRS link moves to UART1.
+  // C3 SuperMini pinout: GPIO20=RX, GPIO21=TX (the default UART0 pads, reused).
+  ELRS_SERIAL.setRxBufferSize(4096);
+  ELRS_SERIAL.begin(460800, SERIAL_8N1, 20, 21);
+  waybeam::host_channel_init();
+#else
   Serial.setRxBufferSize(4096);
   Serial.begin(460800);
+#endif
 
   options_init();
 
@@ -466,9 +492,9 @@ void loop()
     }
   #endif
 
-  if (Serial.available())
+  if (ELRS_SERIAL.available())
   {
-    uint8_t c = Serial.read();
+    uint8_t c = ELRS_SERIAL.read();
 
     // Try to parse MSP packets from the TX
     if (msp.processReceivedByte(c))
@@ -483,6 +509,10 @@ void loop()
     mavlink.ProcessMAVLinkFromTX(c);
   #endif
   }
+
+#ifdef HOST_USB_CDC
+  waybeam::host_channel_poll(now);
+#endif
 
   if (cacheFull && sendCached)
   {

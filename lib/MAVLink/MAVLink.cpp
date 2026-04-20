@@ -2,6 +2,7 @@
 #include <Arduino.h>
 #include "MAVLink.h"
 #include <config.h>
+#include "elrs_serial.h"
 
 void
 MAVLink::ProcessMAVLinkFromTX(uint8_t c)
@@ -56,7 +57,7 @@ MAVLink::ProcessMAVLinkFromGCS(uint8_t *data, uint16_t len)
             // Send the message to the tx uart
             uint8_t buf[MAVLINK_MAX_PACKET_LEN];
             uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
-            Serial.write(buf, len);
+            ELRS_SERIAL.write(buf, len);
             mavlink_stats.packets_uplink++;
         }
     }
