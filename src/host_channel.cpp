@@ -15,10 +15,18 @@ static GENERIC_CRC8 _crc(CRSF_CRC_POLY);
 
 static constexpr uint8_t  FRAME_MAX_LEN = 250;  // CRSF len field is u8
 static constexpr uint32_t HEARTBEAT_PERIOD_MS = 1000;
+static constexpr uint32_t UART_DIAG_PERIOD_MS = 500;
+static constexpr uint8_t  UART_RING_SIZE = 32;
 
 static uint8_t  _rxBuf[FRAME_MAX_LEN + 2];
 static uint8_t  _rxPos = 0;
 static uint32_t _nextHeartbeat = 0;
+static uint32_t _nextDiag = 0;
+
+// ELRS UART diagnostics: total byte count + rolling sample of most recent bytes.
+static volatile uint32_t _elrsTotal = 0;
+static uint8_t  _elrsRing[UART_RING_SIZE];
+static uint8_t  _elrsRingHead = 0;   // next slot to write
 
 static void write_frame(uint8_t subtype, const uint8_t *payload, uint8_t payload_len)
 {
@@ -122,6 +130,14 @@ void host_channel_init()
 {
     Serial.begin(115200);      // USB-CDC; baud is cosmetic on CDC-ACM
     _nextHeartbeat = millis() + 500;
+    _nextDiag      = millis() + 250;
+}
+
+void host_channel_note_elrs_byte(uint8_t c)
+{
+    _elrsTotal++;
+    _elrsRing[_elrsRingHead] = c;
+    _elrsRingHead = (_elrsRingHead + 1) % UART_RING_SIZE;
 }
 
 void host_channel_poll(uint32_t now_ms)
@@ -140,6 +156,22 @@ void host_channel_poll(uint32_t now_ms)
         p[4] = 1; // build_id: increments when protocol breaks
         write_frame(HOST_SUB_HEARTBEAT, p, sizeof(p));
         _nextHeartbeat = now_ms + HEARTBEAT_PERIOD_MS;
+    }
+
+    if ((int32_t)(now_ms - _nextDiag) >= 0) {
+        uint8_t p[4 + 1 + UART_RING_SIZE];
+        const uint32_t total = _elrsTotal;
+        p[0] = (uint8_t)(total);
+        p[1] = (uint8_t)(total >> 8);
+        p[2] = (uint8_t)(total >> 16);
+        p[3] = (uint8_t)(total >> 24);
+        p[4] = UART_RING_SIZE;
+        // Emit ring in chronological order: oldest first, newest last.
+        for (uint8_t i = 0; i < UART_RING_SIZE; ++i) {
+            p[5 + i] = _elrsRing[(_elrsRingHead + i) % UART_RING_SIZE];
+        }
+        write_frame(HOST_SUB_UART_DIAG, p, sizeof(p));
+        _nextDiag = now_ms + UART_DIAG_PERIOD_MS;
     }
 }
 

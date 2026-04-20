@@ -32,6 +32,7 @@ HOST_TYPE = 0x7F
 SUB_HEARTBEAT     = 0x01
 SUB_ESPNOW_RX     = 0x02
 SUB_ESPNOW_TX     = 0x03
+SUB_UART_DIAG     = 0x04
 SUB_PONG          = 0x91
 SUB_INJECT_ESPNOW = 0x10
 SUB_PING          = 0x11
@@ -119,6 +120,11 @@ def pretty(sub: int, p: bytes) -> str:
     if sub == SUB_ESPNOW_TX and len(p) >= 7:
         mac = p[:6]; ok = p[6]
         return f"ESPNOW_TX dst={_fmt_mac(mac)} ok={ok} data={_fmt_hex(p[7:])}"
+    if sub == SUB_UART_DIAG and len(p) >= 5:
+        total = struct.unpack("<I", p[:4])[0]
+        sample_len = p[4]
+        sample = p[5:5 + sample_len]
+        return f"UART_DIAG elrs_bytes={total} ring[{sample_len}]={sample.hex()}"
     if sub == SUB_PONG and len(p) >= 4:
         seq = struct.unpack("<I", p[:4])[0]
         return f"PONG seq={seq}"

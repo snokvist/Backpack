@@ -495,6 +495,9 @@ void loop()
   if (ELRS_SERIAL.available())
   {
     uint8_t c = ELRS_SERIAL.read();
+#ifdef HOST_USB_CDC
+    waybeam::host_channel_note_elrs_byte(c);
+#endif
 
     // Try to parse MSP packets from the TX
     if (msp.processReceivedByte(c))

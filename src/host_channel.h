@@ -34,6 +34,7 @@ enum : uint8_t {
     HOST_SUB_HEARTBEAT    = 0x01,
     HOST_SUB_ESPNOW_RX    = 0x02,
     HOST_SUB_ESPNOW_TX    = 0x03,
+    HOST_SUB_UART_DIAG    = 0x04,   // ELRS UART byte counter + recent-bytes sample
     HOST_SUB_PONG         = 0x91,
 
     HOST_SUB_INJECT_ESPNOW = 0x10,
@@ -46,6 +47,10 @@ void host_channel_poll(uint32_t now_ms);
 // Hook points for the existing Tx_main.cpp code paths.
 void host_channel_emit_espnow_rx(const uint8_t mac[6], const uint8_t *data, uint8_t len);
 void host_channel_emit_espnow_tx(const uint8_t mac[6], bool ok, const uint8_t *data, uint8_t len);
+
+// Tx_main.cpp calls this for every byte read from the ELRS UART so we can
+// report byte-count + rolling hex sample to the host (diagnostic only).
+void host_channel_note_elrs_byte(uint8_t c);
 
 } // namespace waybeam
 
