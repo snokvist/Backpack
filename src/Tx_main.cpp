@@ -120,6 +120,11 @@ void OnDataRecv(uint8_t * mac_addr, uint8_t *data, uint8_t data_len)
 void OnDataRecv(const uint8_t * mac_addr, const uint8_t *data, int data_len)
 #endif
 {
+#if defined(USB_SNIFFER)
+  // Echo the raw ESP-NOW payload to Serial (USB-CDC on ESP32-C3) so a host
+  // can observe on-air MSP traffic. The payload is already MSP-framed.
+  Serial.write(data, data_len);
+#endif
   MSP recv_msp;
   DBGLN("ESP NOW DATA:");
   for(int i = 0; i < data_len; i++)
