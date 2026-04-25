@@ -548,10 +548,25 @@ void SendCachedMSP()
 
 void SetSoftMACAddress()
 {
-  if (!firmwareOptions.hasUID)
+  static const uint8_t zero_mac[6] = {0};
+  const uint8_t *override_addr = config.GetGroupAddress();
+  if (memcmp(override_addr, zero_mac, 6) != 0)
   {
-    memcpy(firmwareOptions.uid, config.GetGroupAddress(), 6);
+    // MSP_ELRS_BIND has set an explicit runtime override (non-zero saved
+    // address). Prefer it over the compile-time MY_BINDING_PHRASE so
+    // host-driven rebind actually takes effect after reboot. To reset to
+    // the compile-time default, send MSP_ELRS_BIND with an all-zero MAC.
+    memcpy(firmwareOptions.uid, override_addr, 6);
   }
+  else if (!firmwareOptions.hasUID)
+  {
+    // No compile-time UID and no runtime override → fall back to the
+    // saved (zero) group address. Same behaviour as before for blank
+    // builds.
+    memcpy(firmwareOptions.uid, override_addr, 6);
+  }
+  // else: keep firmwareOptions.uid populated from the compile-time default
+  // (MY_BINDING_PHRASE hash from options.json).
   DBG("EEPROM MAC = ");
   for (int i = 0; i < 6; i++)
   {

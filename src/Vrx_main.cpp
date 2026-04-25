@@ -306,9 +306,18 @@ void SetupEspNow()
 
 void SetSoftMACAddress()
 {
-  if (!firmwareOptions.hasUID)
+  static const uint8_t zero_mac[6] = {0};
+  const uint8_t *override_addr = config.GetGroupAddress();
+  if (memcmp(override_addr, zero_mac, 6) != 0)
   {
-    memcpy(firmwareOptions.uid, config.GetGroupAddress(), 6);
+    // Runtime override set via MSP_ELRS_BIND wins over MY_BINDING_PHRASE.
+    // Send MSP_ELRS_BIND with all-zero MAC to revert to the compile-time
+    // default.
+    memcpy(firmwareOptions.uid, override_addr, 6);
+  }
+  else if (!firmwareOptions.hasUID)
+  {
+    memcpy(firmwareOptions.uid, override_addr, 6);
   }
   DBG("EEPROM MAC = ");
   for (int i = 0; i < 6; i++)
