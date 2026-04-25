@@ -120,10 +120,21 @@ void OnDataRecv(uint8_t * mac_addr, uint8_t *data, uint8_t data_len)
 void OnDataRecv(const uint8_t * mac_addr, const uint8_t *data, int data_len)
 #endif
 {
-#if defined(USB_SNIFFER)
+#if defined(USB_SNIFFER) && !defined(USB_SNIFFER_DISABLE_FOR_TEST)
   // Echo the raw ESP-NOW payload to Serial (USB-CDC on ESP32-C3) so a host
   // can observe on-air MSP traffic. The payload is already MSP-framed.
-  Serial.write(data, data_len);
+  //
+  // ESP-NOW callbacks run on the WiFi task on the C3's single core. If we
+  // burst Serial.write here at the peer's full cadence the USB-CDC driver
+  // task starves and host->firmware MSP injection breaks. Throttle to at
+  // most one sniffer write every USB_SNIFFER_MIN_GAP_MS milliseconds; also
+  // skip if RX has pending bytes inbound to give injection priority.
+  static unsigned long last_sniff_ms = 0;
+  unsigned long now_ms = millis();
+  if ((now_ms - last_sniff_ms) >= USB_SNIFFER_MIN_GAP_MS) {
+    Serial.write(data, data_len);
+    last_sniff_ms = now_ms;
+  }
 #endif
   MSP recv_msp;
   DBGLN("ESP NOW DATA:");
@@ -390,6 +401,12 @@ void setup()
 #endif
   Serial.setRxBufferSize(4096);
   Serial.begin(460800);
+#if defined(ARDUINO_USB_CDC_ON_BOOT)
+  // HWCDC: don't block ESP-NOW callback in Serial.write when host hasn't
+  // drained the TX FIFO. Drop sniffer bytes on overflow instead — keeping
+  // the main loop responsive matters more than 100% sniffer fidelity.
+  Serial.setTxTimeoutMs(0);
+#endif
 
   options_init();
 
