@@ -146,17 +146,25 @@ take the first 6 bytes — UID `d8:9c:c3:b9:74:3b`.
   `sendMSPViaEspnow` (`Tx_main.cpp` `default:` branch) so injection lands
   on the bound peer.
 
-## Code-level follow-up (2026-04-25)
-
-Not yet re-verified on hardware after the host-controlled sniffer rewrite.
+## Runtime sniffer hardware re-test (2026-04-25)
 
 - Build: `pio run -e ESP32C3_TX_Backpack_via_USB` passes.
+- Flash: explicit C3 USB esptool flow at 115200 baud passes after PlatformIO
+  upload reached the bootloader but failed after switching to 460800.
 - The sniffer defaults to `off`, so injection starts without USB sniffer traffic.
 - Host can query/set mode through `MSP_WAYBEAM_SNIFFER_CTRL` (`0x0042`).
 - The ESP-NOW callback no longer calls `Serial.write`; it copies the newest
   enabled-mode payload into the sniffer staging buffer and returns.
 - Promiscuous mode uses ESP32 Wi-Fi promiscuous management-frame capture and
   parses Espressif ESP-NOW vendor IEs into the same staged MSP stream.
+- Query at boot returns `payload=0001` (`mode=off`, compiled flag set).
+- `MSP_ELRS_GET_BACKPACK_VERSION` returns 10/10 while telemetry is active.
+- `MSP_ELRS_REQU_VTX_PKT` returns the peer's cached `MSP_SET_VTX_CONFIG`.
+- `sniffer bound` returns `payload=0101` and decoded CRSF telemetry flows at
+  the configured one-frame-per-second throttle.
+- `sniffer promiscuous` returns `payload=0203` (`promiscuous_active` set) and
+  decoded current-channel ESP-NOW telemetry flows.
+- `sniffer off` returns `payload=0001`; a 3 second listen window is quiet.
 
 ## Build / flash
 
@@ -260,9 +268,10 @@ These are *not* implemented yet — pick whichever is needed:
    `firmware: "ESP32C3_TX_Backpack"` device entry in `hardware/targets.json`
    that points to the new env. Skipped for now — this variant is a
    developer/CTF tool, not an end-user binary.
-6. **Hardware re-test runtime sniffer control.** Re-flash the PR #3 follow-up
-   and repeat boot-off injection, `sniffer bound`, `sniffer off`, and
-   `sniffer promiscuous` checks with peer telemetry active.
+6. **Multi-peer promiscuous attribution.** Current hardware re-test confirms
+   promiscuous mode becomes active and decodes current-channel telemetry, but
+   only one peer was present. Add sender-MAC framing if attribution across
+   multiple visible peers is needed.
 
 ## Files touched
 
