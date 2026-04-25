@@ -50,6 +50,14 @@ unsigned long rebootTime = 0;
   #endif
 
 static constexpr size_t USB_SNIFFER_MAX_FRAME_SIZE = 260;
+static constexpr uint8_t USB_SNIFFER_MODE_OFF = 0;
+static constexpr uint8_t USB_SNIFFER_MODE_BOUND = 1;
+static constexpr uint8_t USB_SNIFFER_MODE_PROMISCUOUS = 2;
+static constexpr uint8_t USB_SNIFFER_FLAG_COMPILED = 1 << 0;
+static constexpr uint8_t USB_SNIFFER_FLAG_PROMISC_ACTIVE = 1 << 1;
+
+volatile uint8_t sniff_mode = USB_SNIFFER_MODE_OFF;
+volatile bool sniff_promiscuous_active = false;
 static uint8_t sniff_buf[USB_SNIFFER_MAX_FRAME_SIZE];
 static uint8_t sniff_write_buf[USB_SNIFFER_MAX_FRAME_SIZE];
 static size_t sniff_len = 0;
@@ -87,6 +95,123 @@ static bool TakeSniffPayload(size_t *len)
 
   return copied;
 }
+
+static bool IsBoundPeer(const uint8_t *mac_addr)
+{
+  return firmwareOptions.uid[0] == mac_addr[0] &&
+         firmwareOptions.uid[1] == mac_addr[1] &&
+         firmwareOptions.uid[2] == mac_addr[2] &&
+         firmwareOptions.uid[3] == mac_addr[3] &&
+         firmwareOptions.uid[4] == mac_addr[4] &&
+         firmwareOptions.uid[5] == mac_addr[5];
+}
+
+static bool ShouldSniffEspnowCallbackFrame(const uint8_t *mac_addr)
+{
+  uint8_t mode = sniff_mode;
+  return mode == USB_SNIFFER_MODE_PROMISCUOUS ||
+         (mode == USB_SNIFFER_MODE_BOUND && IsBoundPeer(mac_addr));
+}
+
+static const uint8_t *FindEspnowPayloadInActionFrame(const uint8_t *frame,
+                                                     size_t frame_len,
+                                                     size_t *payload_len)
+{
+  static constexpr uint8_t ESPRESSIF_OUI[3] = {0x18, 0xFE, 0x34};
+  static constexpr uint8_t ESP_NOW_VENDOR_TYPE = 0x04;
+  static constexpr size_t MAC_HEADER_LEN = 24;
+
+  if (frame_len <= MAC_HEADER_LEN)
+  {
+    return nullptr;
+  }
+
+  uint8_t frame_type = (frame[0] >> 2) & 0x03;
+  uint8_t frame_subtype = (frame[0] >> 4) & 0x0F;
+  if (frame_type != 0 || frame_subtype != 13)
+  {
+    return nullptr;
+  }
+
+  // ESP-NOW is sent as vendor-specific action frames. Scan for the vendor IE
+  // rather than depending on a fixed action-body offset.
+  size_t pos = MAC_HEADER_LEN;
+  while (pos + 7 <= frame_len)
+  {
+    if (frame[pos] != 0xDD)
+    {
+      ++pos;
+      continue;
+    }
+
+    size_t element_len = frame[pos + 1];
+    size_t element_end = pos + 2 + element_len;
+    if (element_len < 5 || element_end > frame_len)
+    {
+      ++pos;
+      continue;
+    }
+
+    if (memcmp(&frame[pos + 2], ESPRESSIF_OUI, sizeof(ESPRESSIF_OUI)) == 0 &&
+        frame[pos + 5] == ESP_NOW_VENDOR_TYPE)
+    {
+      *payload_len = element_len - 5;
+      return &frame[pos + 7]; // OUI(3) + type(1) + version(1)
+    }
+
+    pos = element_end;
+  }
+
+  return nullptr;
+}
+
+static void OnPromiscuousDataRecv(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+  if (sniff_mode != USB_SNIFFER_MODE_PROMISCUOUS || type != WIFI_PKT_MGMT)
+  {
+    return;
+  }
+
+  wifi_promiscuous_pkt_t *packet = static_cast<wifi_promiscuous_pkt_t *>(buf);
+  size_t frame_len = packet->rx_ctrl.sig_len;
+  if (frame_len > 4)
+  {
+    frame_len -= 4; // sig_len includes FCS; payload buffer does not expose it.
+  }
+
+  size_t payload_len = 0;
+  const uint8_t *payload = FindEspnowPayloadInActionFrame(packet->payload, frame_len, &payload_len);
+  if (payload != nullptr)
+  {
+    StageSniffPayload(payload, payload_len);
+  }
+}
+
+static void ApplySnifferMode(uint8_t requested_mode)
+{
+  if (requested_mode > USB_SNIFFER_MODE_PROMISCUOUS)
+  {
+    requested_mode = USB_SNIFFER_MODE_OFF;
+  }
+
+  sniff_mode = requested_mode;
+
+  if (requested_mode == USB_SNIFFER_MODE_PROMISCUOUS)
+  {
+    wifi_promiscuous_filter_t filter;
+    filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
+    esp_wifi_set_promiscuous_filter(&filter);
+    esp_wifi_set_promiscuous_rx_cb(OnPromiscuousDataRecv);
+    sniff_promiscuous_active = (esp_wifi_set_promiscuous(true) == ESP_OK);
+  }
+  else
+  {
+    esp_wifi_set_promiscuous(false);
+    sniff_promiscuous_active = false;
+  }
+}
+
+static void SendSnifferAck();
 #endif
 
 bool cacheFull = false;
@@ -177,7 +302,11 @@ void OnDataRecv(const uint8_t * mac_addr, const uint8_t *data, int data_len)
   // We DO NOT call Serial.write from this WiFi-task callback because on
   // the C3's single core that starves the main loop's Serial.read,
   // breaking host->firmware MSP injection. memcpy + flag is microseconds.
-  StageSniffPayload(data, static_cast<size_t>(data_len));
+  bool bound_peer = IsBoundPeer(mac_addr);
+  if (ShouldSniffEspnowCallbackFrame(mac_addr))
+  {
+    StageSniffPayload(data, static_cast<size_t>(data_len));
+  }
 #endif
   MSP recv_msp;
   DBGLN("ESP NOW DATA:");
@@ -187,12 +316,16 @@ void OnDataRecv(const uint8_t * mac_addr, const uint8_t *data, int data_len)
     {
       // Finished processing a complete packet
       // Only process packets from a bound MAC address
+#if defined(USB_CDC_SNIFFER_ENABLED)
+      if (bound_peer)
+#else
       if (firmwareOptions.uid[0] == mac_addr[0] &&
           firmwareOptions.uid[1] == mac_addr[1] &&
           firmwareOptions.uid[2] == mac_addr[2] &&
           firmwareOptions.uid[3] == mac_addr[3] &&
           firmwareOptions.uid[4] == mac_addr[4] &&
           firmwareOptions.uid[5] == mac_addr[5])
+#endif
       {
         ProcessMSPPacketFromPeer(recv_msp.getReceivedPacket());
       }
@@ -214,6 +347,24 @@ void SendVersionResponse()
   }
   msp.sendPacket(&out, &Serial);
 }
+
+#if defined(USB_CDC_SNIFFER_ENABLED)
+static void SendSnifferAck()
+{
+  mspPacket_t out;
+  out.reset();
+  out.makeResponse();
+  out.function = MSP_WAYBEAM_SNIFFER_CTRL;
+  out.addByte(sniff_mode);
+  uint8_t flags = USB_SNIFFER_FLAG_COMPILED;
+  if (sniff_promiscuous_active)
+  {
+    flags |= USB_SNIFFER_FLAG_PROMISC_ACTIVE;
+  }
+  out.addByte(flags);
+  msp.sendPacket(&out, &Serial);
+}
+#endif
 
 void HandleConfigMsg(mspPacket_t *packet)
 {
@@ -274,6 +425,17 @@ void ProcessMSPPacketFromTX(mspPacket_t *packet)
     DBGLN("Processing MSP_ELRS_GET_BACKPACK_VERSION...");
     SendVersionResponse();
     break;
+
+#if defined(USB_CDC_SNIFFER_ENABLED)
+  case MSP_WAYBEAM_SNIFFER_CTRL:
+    DBGLN("Processing MSP_WAYBEAM_SNIFFER_CTRL...");
+    if (packet->payloadSize >= 1)
+    {
+      ApplySnifferMode(packet->payload[0]);
+    }
+    SendSnifferAck();
+    break;
+#endif
 
   case MSP_ELRS_BACKPACK_SET_HEAD_TRACKING:
     DBGLN("Processing MSP_ELRS_BACKPACK_SET_HEAD_TRACKING...");
