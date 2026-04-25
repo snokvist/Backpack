@@ -1,6 +1,6 @@
 # ESP32-C3 TX Backpack over USB-C (ESP-NOW listen + inject)
 
-Working notes for the `claude/esp32-c3-usb-backpack-iGNXl` branch. Picks up the
+Working notes for PR #3 / `fix/sniffer-throttle-c3-usb-cdc`. Picks up the
 "can the C3 TX backpack act as a USB ↔ ESP-NOW bridge?" thread so a fresh
 Claude CLI session has the full context.
 
@@ -46,9 +46,14 @@ The on-air HT data shape is from `module_base.cpp:73-87`:
 Wrapped in MSP v2: `$ X < flag(0) func_lo func_hi len_lo len_hi <payload> crc`
 with `func = 0x0383`, `len = 6`.
 
-## Changes on this branch
+## Changes on this branch / PR
 
-Commit `901c157` — *Add ESP32-C3 TX Backpack USB-CDC variant with ESP-NOW sniffer*.
+Baseline commit `151537b` — *Add ESP32-C3 TX Backpack USB-CDC variant with
+ESP-NOW sniffer*.
+
+PR #3 commit `736fece` and local follow-up work change the sniffer from a
+direct ESP-NOW callback write into a staged, throttled USB-CDC drain from the
+main loop.
 
 ### `targets/txbp_esp.ini` — new env
 
@@ -58,6 +63,8 @@ Commit `901c157` — *Add ESP32-C3 TX Backpack USB-CDC variant with ESP-NOW snif
 ```
 -D ARDUINO_USB_CDC_ON_BOOT=1
 -D USB_SNIFFER=1
+-D USB_SNIFFER_MIN_GAP_MS=1000
+-D USB_SNIFFER_QUIET_AFTER_RX_MS=500
 ```
 
 `ARDUINO_USB_CDC_ON_BOOT` makes `Serial` resolve to the C3's built-in
@@ -65,21 +72,26 @@ USB-Serial-JTAG (HWCDC), so MSP I/O lands on the USB-C port directly.
 
 ### `src/Tx_main.cpp` — sniffer hook
 
-At the top of `OnDataRecv`:
+The sniffer is enabled only for the ESP32 USB-CDC target:
 
 ```cpp
-#if defined(USB_SNIFFER)
-  // Echo the raw ESP-NOW payload to Serial (USB-CDC on ESP32-C3) so a host
-  // can observe on-air MSP traffic. The payload is already MSP-framed.
-  Serial.write(data, data_len);
+#if defined(USB_SNIFFER) && defined(ARDUINO_USB_CDC_ON_BOOT) && defined(PLATFORM_ESP32)
+  #define USB_CDC_SNIFFER_ENABLED 1
 #endif
 ```
 
-Runs **before** the bound-MAC filter, so any frame the ESP-NOW stack
-delivers (bound peer + broadcast) is forwarded to the host verbatim. Bytes
-are MSP-framed already; a host-side MSP v2 parser decodes them directly.
+`OnDataRecv` runs **before** the bound-MAC filter, so any frame the ESP-NOW
+stack delivers (bound peer + broadcast) can be observed. It now only stages
+the latest payload into a single-frame buffer protected by a short ESP32
+critical section. `loop()` drains that buffer to `Serial` after:
+
+- `USB_SNIFFER_MIN_GAP_MS` has elapsed since the last sniffer drain.
+- `USB_SNIFFER_QUIET_AFTER_RX_MS` has elapsed since the host last sent a byte.
+
+Bytes are MSP-framed already; a host-side MSP v2 parser decodes them directly.
 Sender MAC is intentionally not included to keep the stream clean — add it
-later if needed.
+later if needed. The sniffer is best effort: if the host is not draining USB,
+stale frames are dropped rather than blocking MSP injection.
 
 `DBG/DBGLN` are no-ops without `DEBUG_LOG`, so no extra noise on the wire.
 `INFOLN`/`ERRLN` always print but are sparse and can be ignored or filtered
@@ -107,6 +119,16 @@ take the first 6 bytes — UID `d8:9c:c3:b9:74:3b`.
   accepted without crash; the firmware forwards unknown MSP via
   `sendMSPViaEspnow` (`Tx_main.cpp` `default:` branch) so injection lands
   on the bound peer.
+
+## Code-level follow-up (2026-04-25)
+
+Not yet re-verified on hardware after the staged-main-loop rewrite.
+
+- Build: `pio run -e ESP32C3_TX_Backpack_via_USB` passes.
+- The ESP-NOW callback no longer calls `Serial.write`; it copies the newest
+  payload into the sniffer staging buffer and returns.
+- The main loop drains at most one staged frame per throttle interval and
+  holds off briefly after host RX bytes so inject responses get priority.
 
 ## Build / flash
 
@@ -156,6 +178,9 @@ Listening: read the same port, feed bytes to an MSP v2 parser, dispatch by
 
 ## Caveats / known limits
 
+- **Best-effort stream**: only the newest pending ESP-NOW payload is retained.
+  This is intentional for telemetry snapshots and keeps USB backpressure from
+  breaking host-to-firmware MSP injection.
 - **MAC filtering**: only the `USB_SNIFFER` echo bypasses the bound-MAC
   filter. The internal MSP dispatcher still ignores frames from other
   senders. That's fine for this feature but means a host can't easily talk
@@ -198,15 +223,16 @@ These are *not* implemented yet — pick whichever is needed:
    `firmware: "ESP32C3_TX_Backpack"` device entry in `hardware/targets.json`
    that points to the new env. Skipped for now — this variant is a
    developer/CTF tool, not an end-user binary.
-6. **CI build.** Confirm the env compiles in CI; PIO isn't available in
-   the agent sandbox so this hasn't been verified locally.
+6. **Hardware re-test staged drain.** Re-flash the PR #3 follow-up and repeat
+   `listen`, `version`, and `vtx` host checks with the peer actively sending
+   CRSF telemetry.
 
 ## Files touched
 
-- `targets/txbp_esp.ini` — new `env:ESP32C3_TX_Backpack_via_USB`
-- `src/Tx_main.cpp` — `USB_SNIFFER` echo in `OnDataRecv`
+- `targets/txbp_esp.ini` — `env:ESP32C3_TX_Backpack_via_USB` sniffer timing flags
+- `src/Tx_main.cpp` — staged USB-CDC sniffer drain for ESP-NOW payloads
 - `docs/esp32c3_usb_backpack.md` — this file
 
 ## Branch
 
-`claude/esp32-c3-usb-backpack-iGNXl` (pushed to `origin`). No PR opened.
+`fix/sniffer-throttle-c3-usb-cdc` (PR #3).

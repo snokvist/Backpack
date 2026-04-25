@@ -37,6 +37,58 @@ connectionState_e connectionState = starting;
 wifi_service_t wifiService = WIFI_SERVICE_UPDATE;
 unsigned long rebootTime = 0;
 
+#if defined(USB_SNIFFER) && defined(ARDUINO_USB_CDC_ON_BOOT) && defined(PLATFORM_ESP32) && !defined(USB_SNIFFER_DISABLE_FOR_TEST)
+  #define USB_CDC_SNIFFER_ENABLED 1
+#endif
+
+#if defined(USB_CDC_SNIFFER_ENABLED)
+  #ifndef USB_SNIFFER_MIN_GAP_MS
+    #define USB_SNIFFER_MIN_GAP_MS 100
+  #endif
+  #ifndef USB_SNIFFER_QUIET_AFTER_RX_MS
+    #define USB_SNIFFER_QUIET_AFTER_RX_MS 0
+  #endif
+
+static constexpr size_t USB_SNIFFER_MAX_FRAME_SIZE = 260;
+static uint8_t sniff_buf[USB_SNIFFER_MAX_FRAME_SIZE];
+static uint8_t sniff_write_buf[USB_SNIFFER_MAX_FRAME_SIZE];
+static size_t sniff_len = 0;
+static bool sniff_pending = false;
+static unsigned long last_host_rx_ms = 0;
+static portMUX_TYPE sniff_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void StageSniffPayload(const uint8_t *data, size_t len)
+{
+  if (len == 0 || len > USB_SNIFFER_MAX_FRAME_SIZE)
+  {
+    return;
+  }
+
+  portENTER_CRITICAL(&sniff_mux);
+  memcpy(sniff_buf, data, len);
+  sniff_len = len;
+  sniff_pending = true;
+  portEXIT_CRITICAL(&sniff_mux);
+}
+
+static bool TakeSniffPayload(size_t *len)
+{
+  bool copied = false;
+
+  portENTER_CRITICAL(&sniff_mux);
+  if (sniff_pending && sniff_len <= USB_SNIFFER_MAX_FRAME_SIZE)
+  {
+    *len = sniff_len;
+    memcpy(sniff_write_buf, sniff_buf, sniff_len);
+    sniff_pending = false;
+    copied = true;
+  }
+  portEXIT_CRITICAL(&sniff_mux);
+
+  return copied;
+}
+#endif
+
 bool cacheFull = false;
 bool sendCached = false;
 
@@ -120,21 +172,12 @@ void OnDataRecv(uint8_t * mac_addr, uint8_t *data, uint8_t data_len)
 void OnDataRecv(const uint8_t * mac_addr, const uint8_t *data, int data_len)
 #endif
 {
-#if defined(USB_SNIFFER) && !defined(USB_SNIFFER_DISABLE_FOR_TEST)
-  // Echo the raw ESP-NOW payload to Serial (USB-CDC on ESP32-C3) so a host
-  // can observe on-air MSP traffic. The payload is already MSP-framed.
-  //
-  // ESP-NOW callbacks run on the WiFi task on the C3's single core. If we
-  // burst Serial.write here at the peer's full cadence the USB-CDC driver
-  // task starves and host->firmware MSP injection breaks. Throttle to at
-  // most one sniffer write every USB_SNIFFER_MIN_GAP_MS milliseconds; also
-  // skip if RX has pending bytes inbound to give injection priority.
-  static unsigned long last_sniff_ms = 0;
-  unsigned long now_ms = millis();
-  if ((now_ms - last_sniff_ms) >= USB_SNIFFER_MIN_GAP_MS) {
-    Serial.write(data, data_len);
-    last_sniff_ms = now_ms;
-  }
+#if defined(USB_CDC_SNIFFER_ENABLED)
+  // Stage the latest ESP-NOW payload for the main loop to write out.
+  // We DO NOT call Serial.write from this WiFi-task callback because on
+  // the C3's single core that starves the main loop's Serial.read,
+  // breaking host->firmware MSP injection. memcpy + flag is microseconds.
+  StageSniffPayload(data, static_cast<size_t>(data_len));
 #endif
   MSP recv_msp;
   DBGLN("ESP NOW DATA:");
@@ -401,10 +444,9 @@ void setup()
 #endif
   Serial.setRxBufferSize(4096);
   Serial.begin(460800);
-#if defined(ARDUINO_USB_CDC_ON_BOOT)
-  // HWCDC: don't block ESP-NOW callback in Serial.write when host hasn't
-  // drained the TX FIFO. Drop sniffer bytes on overflow instead — keeping
-  // the main loop responsive matters more than 100% sniffer fidelity.
+#if defined(USB_CDC_SNIFFER_ENABLED)
+  // HWCDC: drop sniffer bytes on overflow instead of blocking the main loop.
+  // Keeping MSP injection responsive matters more than full sniffer fidelity.
   Serial.setTxTimeoutMs(0);
 #endif
 
@@ -491,6 +533,12 @@ void loop()
   if (Serial.available())
   {
     uint8_t c = Serial.read();
+#if defined(USB_CDC_SNIFFER_ENABLED)
+    // Tell the sniffer (running on the WiFi task) to back off briefly so
+    // host->firmware MSP injection + the response can complete without
+    // the sniffer hogging the USB controller.
+    last_host_rx_ms = millis();
+#endif
 
     // Try to parse MSP packets from the TX
     if (msp.processReceivedByte(c))
@@ -511,4 +559,23 @@ void loop()
     SendCachedMSP();
     sendCached = false;
   }
+
+#if defined(USB_CDC_SNIFFER_ENABLED)
+  // Drain the staged ESP-NOW payload into Serial here — same task as
+  // Serial.read above, so they don't fight. Throttle to USB_SNIFFER_MIN_GAP_MS
+  // and pause for USB_SNIFFER_QUIET_AFTER_RX_MS after the host last sent us
+  // bytes so an inject + response can finish unimpeded.
+  unsigned long now_ms = millis();
+  static unsigned long last_sniff_ms = 0;
+  bool host_rx_active = (now_ms - last_host_rx_ms) < USB_SNIFFER_QUIET_AFTER_RX_MS;
+  if ((now_ms - last_sniff_ms) >= USB_SNIFFER_MIN_GAP_MS && !host_rx_active) {
+    size_t len = 0;
+    if (TakeSniffPayload(&len)) {
+      if (Serial.availableForWrite() >= (int)len) {
+        Serial.write(sniff_write_buf, len);
+      }
+      last_sniff_ms = now_ms;
+    }
+  }
+#endif
 }
