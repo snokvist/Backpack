@@ -85,6 +85,29 @@ later if needed.
 `INFOLN`/`ERRLN` always print but are sparse and can be ignored or filtered
 by the host.
 
+## Verified on hardware (2026-04-25)
+
+Bench test on an ESP32-C3 SuperMini (MAC `94:a9:90:7b:33:48`) bound to a
+second TX-Backpack peer via shared `MAYONAISE` binding phrase. Both ends
+hash the full `-DMY_BINDING_PHRASE="MAYONAISE"` define string with MD5 and
+take the first 6 bytes — UID `d8:9c:c3:b9:74:3b`.
+
+- Build: `pio run -e ESP32C3_TX_Backpack_via_USB` — 940 KB firmware, 47.9 %
+  flash, 15.1 % RAM on the C3.
+- First flash via the BOOT-mode esptool workaround
+  (`--before no_reset --baud 115200`); subsequent reflashes over running
+  USB-CDC firmware also need this — `default_reset` deadlocks against the
+  HWCDC endpoint.
+- USB-CDC enumerates as `/dev/ttyACM0` (`303a:1001`).
+- With the peer transmitting CRSF telemetry over ESP-NOW, the host
+  observed continuous MSP v2 frames at ~5 Hz, all starting with `$X<` and
+  carrying function `0x0011` (`MSP_ELRS_BACKPACK_CRSF_TLM`). Each
+  `OnDataRecv` callback delivered a `data_len = 216` payload.
+- A single MSP_ELRS_BACKPACK_SET_PTR frame written to `/dev/ttyACM0` was
+  accepted without crash; the firmware forwards unknown MSP via
+  `sendMSPViaEspnow` (`Tx_main.cpp` `default:` branch) so injection lands
+  on the bound peer.
+
 ## Build / flash
 
 ```
