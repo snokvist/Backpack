@@ -1,6 +1,6 @@
 # ESP32-C3 TX Backpack over USB-C (ESP-NOW listen + inject)
 
-Working notes for the `claude/esp32-c3-usb-backpack-iGNXl` branch. Picks up the
+Working notes for PR #3 / `fix/sniffer-throttle-c3-usb-cdc`. Picks up the
 "can the C3 TX backpack act as a USB ↔ ESP-NOW bridge?" thread so a fresh
 Claude CLI session has the full context.
 
@@ -46,9 +46,14 @@ The on-air HT data shape is from `module_base.cpp:73-87`:
 Wrapped in MSP v2: `$ X < flag(0) func_lo func_hi len_lo len_hi <payload> crc`
 with `func = 0x0383`, `len = 6`.
 
-## Changes on this branch
+## Changes on this branch / PR
 
-Commit `901c157` — *Add ESP32-C3 TX Backpack USB-CDC variant with ESP-NOW sniffer*.
+Baseline commit `151537b` — *Add ESP32-C3 TX Backpack USB-CDC variant with
+ESP-NOW sniffer*.
+
+PR #3 commit `736fece` and follow-up work change the sniffer from a direct
+ESP-NOW callback write into a host-controlled, staged USB-CDC drain from the
+main loop. The sniffer is compiled in but disabled at boot.
 
 ### `targets/txbp_esp.ini` — new env
 
@@ -58,28 +63,61 @@ Commit `901c157` — *Add ESP32-C3 TX Backpack USB-CDC variant with ESP-NOW snif
 ```
 -D ARDUINO_USB_CDC_ON_BOOT=1
 -D USB_SNIFFER=1
+-D USB_SNIFFER_MIN_GAP_MS=1000
+-D USB_SNIFFER_QUIET_AFTER_RX_MS=500
 ```
 
 `ARDUINO_USB_CDC_ON_BOOT` makes `Serial` resolve to the C3's built-in
 USB-Serial-JTAG (HWCDC), so MSP I/O lands on the USB-C port directly.
 
+### Runtime control MSP
+
+The host controls the sniffer with `MSP_WAYBEAM_SNIFFER_CTRL` (`0x0042`):
+
+| Direction | Payload | Meaning |
+|---|---|---|
+| host → firmware | empty | query current mode |
+| host → firmware | `[mode]` | set mode: `0=off`, `1=bound`, `2=promiscuous` |
+| firmware → host | `[mode flags]` | ack with current mode and flags |
+
+Flags:
+
+| Bit | Meaning |
+|---|---|
+| `0x01` | sniffer support compiled in |
+| `0x02` | ESP32 Wi-Fi promiscuous capture currently active |
+
 ### `src/Tx_main.cpp` — sniffer hook
 
-At the top of `OnDataRecv`:
+The sniffer is enabled only for the ESP32 USB-CDC target:
 
 ```cpp
-#if defined(USB_SNIFFER)
-  // Echo the raw ESP-NOW payload to Serial (USB-CDC on ESP32-C3) so a host
-  // can observe on-air MSP traffic. The payload is already MSP-framed.
-  Serial.write(data, data_len);
+#if defined(USB_SNIFFER) && defined(ARDUINO_USB_CDC_ON_BOOT) && defined(PLATFORM_ESP32)
+  #define USB_CDC_SNIFFER_ENABLED 1
 #endif
 ```
 
-Runs **before** the bound-MAC filter, so any frame the ESP-NOW stack
-delivers (bound peer + broadcast) is forwarded to the host verbatim. Bytes
-are MSP-framed already; a host-side MSP v2 parser decodes them directly.
+`OnDataRecv` only stages when runtime mode is not `off`. In `bound` mode, it
+stages ESP-NOW callback payloads from the configured bound MAC. In
+`promiscuous` mode, it also enables ESP32 Wi-Fi promiscuous management-frame
+capture and extracts ESP-NOW vendor IE payloads from any sender on the current
+Wi-Fi channel.
+
+The peer dispatcher remains bound-only: `ProcessMSPPacketFromPeer` still runs
+only for packets from `firmwareOptions.uid`, so changing sniffer scope does not
+change injection routing or peer command handling.
+
+The sniffer stages only the latest payload into a single-frame buffer protected
+by a short ESP32 critical section. `loop()` drains that buffer to `Serial`
+after:
+
+- `USB_SNIFFER_MIN_GAP_MS` has elapsed since the last sniffer drain.
+- `USB_SNIFFER_QUIET_AFTER_RX_MS` has elapsed since the host last sent a byte.
+
+Bytes are MSP-framed already; a host-side MSP v2 parser decodes them directly.
 Sender MAC is intentionally not included to keep the stream clean — add it
-later if needed.
+later if needed. The sniffer is best effort: if the host is not draining USB,
+stale frames are dropped rather than blocking MSP injection.
 
 `DBG/DBGLN` are no-ops without `DEBUG_LOG`, so no extra noise on the wire.
 `INFOLN`/`ERRLN` always print but are sparse and can be ignored or filtered
@@ -107,6 +145,26 @@ take the first 6 bytes — UID `d8:9c:c3:b9:74:3b`.
   accepted without crash; the firmware forwards unknown MSP via
   `sendMSPViaEspnow` (`Tx_main.cpp` `default:` branch) so injection lands
   on the bound peer.
+
+## Runtime sniffer hardware re-test (2026-04-25)
+
+- Build: `pio run -e ESP32C3_TX_Backpack_via_USB` passes.
+- Flash: explicit C3 USB esptool flow at 115200 baud passes after PlatformIO
+  upload reached the bootloader but failed after switching to 460800.
+- The sniffer defaults to `off`, so injection starts without USB sniffer traffic.
+- Host can query/set mode through `MSP_WAYBEAM_SNIFFER_CTRL` (`0x0042`).
+- The ESP-NOW callback no longer calls `Serial.write`; it copies the newest
+  enabled-mode payload into the sniffer staging buffer and returns.
+- Promiscuous mode uses ESP32 Wi-Fi promiscuous management-frame capture and
+  parses Espressif ESP-NOW vendor IEs into the same staged MSP stream.
+- Query at boot returns `payload=0001` (`mode=off`, compiled flag set).
+- `MSP_ELRS_GET_BACKPACK_VERSION` returns 10/10 while telemetry is active.
+- `MSP_ELRS_REQU_VTX_PKT` returns the peer's cached `MSP_SET_VTX_CONFIG`.
+- `sniffer bound` returns `payload=0101` and decoded CRSF telemetry flows at
+  the configured one-frame-per-second throttle.
+- `sniffer promiscuous` returns `payload=0203` (`promiscuous_active` set) and
+  decoded current-channel ESP-NOW telemetry flows.
+- `sniffer off` returns `payload=0001`; a 3 second listen window is quiet.
 
 ## Build / flash
 
@@ -154,16 +212,28 @@ def send_ptr(yaw_deg, pitch_deg, roll_deg):
 Listening: read the same port, feed bytes to an MSP v2 parser, dispatch by
 `function`.
 
+Sniffer mode examples with `Waybeam-backpack-android` tooling:
+
+```
+backpack-cli sniffer          # query
+backpack-cli sniffer bound    # bound peer only
+backpack-cli sniffer off      # quiet for injection
+backpack-cli sniffer promiscuous
+```
+
 ## Caveats / known limits
 
-- **MAC filtering**: only the `USB_SNIFFER` echo bypasses the bound-MAC
-  filter. The internal MSP dispatcher still ignores frames from other
-  senders. That's fine for this feature but means a host can't easily talk
-  to *unbound* nearby devices through the backpack.
-- **Channel lock**: ESP-NOW is on Wi-Fi channel 1 here
-  (`Tx_main.cpp:352`, `WiFi.begin(..., 1)`). For multi-channel sniffing
-  you'd swap to `esp_wifi_set_promiscuous` / `esp_wifi_set_channel`, which
-  is out of scope.
+- **Default off**: `USB_SNIFFER=1` means support is compiled in, not active.
+  The host must enable `bound` or `promiscuous` mode explicitly.
+- **Best-effort stream**: only the newest pending ESP-NOW payload is retained.
+  This is intentional for telemetry snapshots and keeps USB backpressure from
+  breaking host-to-firmware MSP injection.
+- **MAC filtering**: sniffer mode can observe unbound senders, but the internal
+  MSP dispatcher still ignores frames from other senders. That's deliberate:
+  promiscuous sniffing does not make the backpack inject to arbitrary peers.
+- **Channel lock**: ESP-NOW is on Wi-Fi channel 1 here (`WiFi.begin(..., 1)`).
+  Promiscuous mode captures the current Wi-Fi channel only; channel hopping
+  with `esp_wifi_set_channel` is out of scope.
 - **Buffer size**: `MSP_PORT_INBUF_SIZE = 64` (`lib/MSP/msp.h:9`). PTR and
   most backpack MSP frames are well under that, but custom OSD payloads
   brush against it.
@@ -198,15 +268,18 @@ These are *not* implemented yet — pick whichever is needed:
    `firmware: "ESP32C3_TX_Backpack"` device entry in `hardware/targets.json`
    that points to the new env. Skipped for now — this variant is a
    developer/CTF tool, not an end-user binary.
-6. **CI build.** Confirm the env compiles in CI; PIO isn't available in
-   the agent sandbox so this hasn't been verified locally.
+6. **Multi-peer promiscuous attribution.** Current hardware re-test confirms
+   promiscuous mode becomes active and decodes current-channel telemetry, but
+   only one peer was present. Add sender-MAC framing if attribution across
+   multiple visible peers is needed.
 
 ## Files touched
 
-- `targets/txbp_esp.ini` — new `env:ESP32C3_TX_Backpack_via_USB`
-- `src/Tx_main.cpp` — `USB_SNIFFER` echo in `OnDataRecv`
+- `lib/MSP/msptypes.h` — `MSP_WAYBEAM_SNIFFER_CTRL` (`0x0042`)
+- `targets/txbp_esp.ini` — `env:ESP32C3_TX_Backpack_via_USB` sniffer timing flags
+- `src/Tx_main.cpp` — runtime sniffer mode control and staged USB-CDC sniffer drain
 - `docs/esp32c3_usb_backpack.md` — this file
 
 ## Branch
 
-`claude/esp32-c3-usb-backpack-iGNXl` (pushed to `origin`). No PR opened.
+`fix/sniffer-throttle-c3-usb-cdc` (PR #3).
