@@ -221,6 +221,48 @@ backpack-cli sniffer off      # quiet for injection
 backpack-cli sniffer promiscuous
 ```
 
+## C3 USB-CDC bidirectional behaviour and arduino-esp32 v2.0.16 vs v2.0.17
+
+The USB-Serial-JTAG controller on the ESP32-C3 is full-duplex by spec.
+It has separate 64-byte hardware RX and TX FIFOs and is documented to
+support simultaneous device-side TX and host-side TX. In practice on
+**arduino-esp32 v2.0.16** (which `espressif32@6.7.0` pinned), any
+active device-side `Serial.write` reliably starves `Serial.read`. The
+SOF-tick connection-state tracking and the `rx_queue` overflow handling
+in `cores/esp32/HWCDC.cpp` interact badly under heavy bidirectional
+traffic — the connected flag wobbles enough that `Serial.read` returns
+no bytes for the duration of the sniffer stream.
+
+Manifestation in this project: PR #2's continuous sniffer broke MSP
+injection. PR #3 worked around it by introducing host-controlled
+sniffer modes, time throttling, a "quiet after host RX" gate, and a
+request/response auto-quiet wrapper on the Python side. None of those
+were complete fixes — even with sniffer throttled to 1 Hz, inject
+silently failed under bound-mode load.
+
+**Real fix: arduino-esp32 v2.0.17 (`espressif32@6.11.0`).** Bench
+results on the same C3 SuperMini, same firmware logic, only the
+platform pin changed:
+
+| | v2.0.16 (espressif32@6.7.0) | v2.0.17 (espressif32@6.11.0) |
+|---|---|---|
+| Inject under bound-mode sniffer (no auto-quiet) | 0/30 | 30/30 |
+| Sniffer + inject genuinely simultaneous | no | yes |
+| `request_vtx_config` peer round-trip while sniffing | times out | 5/5 |
+
+PR #3's host-controlled sniffer modes stay because they are useful on
+their own: clean boot, on-demand sniffing, promiscuous capture. The
+auto-quiet wrapper in `Waybeam-backpack-android/server/backpack.py`
+becomes paranoia and can be removed if an Android UI prefers always-on
+sniffing.
+
+For any future variant where bidirectional USB-CDC under heavy load
+matters more than this firmware needs it to, prefer an **ESP32-S3
+SuperMini** (TinyUSB + full USB OTG hardware + dual core). The C3's
+USB-Serial-JTAG controller is single-endpoint, single-core, and
+shares its peripheral with debug — even on v2.0.17 it has less
+headroom than the S3 for serious USB-CDC work.
+
 ## Caveats / known limits
 
 - **Default off**: `USB_SNIFFER=1` means support is compiled in, not active.
@@ -232,8 +274,12 @@ backpack-cli sniffer promiscuous
   MSP dispatcher still ignores frames from other senders. That's deliberate:
   promiscuous sniffing does not make the backpack inject to arbitrary peers.
 - **Channel lock**: ESP-NOW is on Wi-Fi channel 1 here (`WiFi.begin(..., 1)`).
-  Promiscuous mode captures the current Wi-Fi channel only; channel hopping
-  with `esp_wifi_set_channel` is out of scope.
+  All ELRS-Backpack roles (TX, VRX, Timer) hardcode channel 1 in
+  `setup()` and use `peerInfo.channel = 0` (= "current channel"). Channel
+  hopping is therefore intentionally not implemented — promiscuous mode
+  on channel 1 already covers the entire ELRS-Backpack ecosystem. Hopping
+  would only be useful for non-Backpack ESP-NOW gear or wireless
+  surveying, neither of which is in scope.
 - **Buffer size**: `MSP_PORT_INBUF_SIZE = 64` (`lib/MSP/msp.h:9`). PTR and
   most backpack MSP frames are well under that, but custom OSD payloads
   brush against it.
