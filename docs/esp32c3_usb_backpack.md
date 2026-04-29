@@ -87,6 +87,32 @@ Flags:
 | `0x01` | sniffer support compiled in |
 | `0x02` | ESP32 Wi-Fi promiscuous capture currently active |
 
+### Promiscuous discovery MSP
+
+In `promiscuous` mode the firmware emits one async MSP frame per received
+ESP-NOW frame, regardless of whether the source MAC matches the bound peer.
+This is what host-side discovery uses to enumerate visible TXes before
+calling `MSP_ELRS_BIND`.
+
+`MSP_WAYBEAM_SNIFFED_CRSF` (`0x0043`, firmware → host, async push):
+
+| Offset | Size | Field          | Notes                                   |
+|--------|------|----------------|-----------------------------------------|
+| 0      | 6    | `src_mac`      | 802.11 source address (little-endian byte order, `mac[0]` first) |
+| 6      | 1    | `rssi_dbm`     | signed int8, from `rx_ctrl->rssi`       |
+| 7      | 1    | `channel`      | current Wi-Fi channel, from `rx_ctrl->channel` |
+| 8      | N    | `crsf_frame`   | unmodified ESP-NOW vendor payload (the same bytes the bound-mode sniffer relays today) |
+
+Behaviour:
+
+- Emitted on **every** received ESP-NOW frame while `mode = promiscuous`,
+  regardless of source MAC.
+- **Not** emitted in `bound` or `off` mode. `bound` keeps emitting the raw
+  inbound ESP-NOW frame as before — typically an `MSP_ELRS_BACKPACK_CRSF_TLM`
+  (`0x0011`) envelope from the bound peer.
+- No per-peer state is kept on the chip. The host maintains the seen-peer
+  list and decides when to call `MSP_ELRS_BIND` (`0x09`) to lock onto one.
+
 ### `src/Tx_main.cpp` — sniffer hook
 
 The sniffer is enabled only for the ESP32 USB-CDC target:
@@ -115,9 +141,14 @@ after:
 - `USB_SNIFFER_QUIET_AFTER_RX_MS` has elapsed since the host last sent a byte.
 
 Bytes are MSP-framed already; a host-side MSP v2 parser decodes them directly.
-Sender MAC is intentionally not included to keep the stream clean — add it
-later if needed. The sniffer is best effort: if the host is not draining USB,
-stale frames are dropped rather than blocking MSP injection.
+In `bound` mode the staged bytes are the raw inbound ESP-NOW frame (typically
+an `MSP_ELRS_BACKPACK_CRSF_TLM` envelope), as before. In `promiscuous` mode
+the staged bytes are an `MSP_WAYBEAM_SNIFFED_CRSF` (`0x0043`) frame built in
+firmware that prepends `src_mac (6) + rssi (1) + channel (1)` to the raw
+ESP-NOW vendor payload, so the host can attribute each frame to its sender
+without any per-peer state on the chip. The sniffer is best effort: if the
+host is not draining USB, stale frames are dropped rather than blocking MSP
+injection.
 
 `DBG/DBGLN` are no-ops without `DEBUG_LOG`, so no extra noise on the wire.
 `INFOLN`/`ERRLN` always print but are sparse and can be ignored or filtered
@@ -293,12 +324,10 @@ headroom than the S3 for serious USB-CDC work.
 
 These are *not* implemented yet — pick whichever is needed:
 
-1. **Tag sniffed frames with sender MAC.** Wrap each received ESP-NOW
-   payload in an MSP envelope (e.g. new function `MSP_ELRS_BACKPACK_SNIFF
-   = 0x0384`) carrying `[mac(6) + original_bytes]`. Gives the host
-   per-frame attribution, costs a new function code in `msptypes.h` and a
-   helper in `OnDataRecv`. Note `MSP_PORT_INBUF_SIZE` needs to be large
-   enough for `6 + max_payload`.
+1. ~~**Tag sniffed frames with sender MAC.**~~ Done — see
+   `MSP_WAYBEAM_SNIFFED_CRSF` (`0x0043`) above. Promiscuous mode now wraps
+   each ESP-NOW payload with `src_mac + rssi + channel` so the host can
+   build a seen-peer list. Bound mode is unchanged.
 2. **Sniffer build flag without USB-CDC.** Split `USB_SNIFFER` from the
    USB-CDC env so the same flag works on the UART variant when wired
    through an external USB-UART.
@@ -314,16 +343,23 @@ These are *not* implemented yet — pick whichever is needed:
    `firmware: "ESP32C3_TX_Backpack"` device entry in `hardware/targets.json`
    that points to the new env. Skipped for now — this variant is a
    developer/CTF tool, not an end-user binary.
-6. **Multi-peer promiscuous attribution.** Current hardware re-test confirms
-   promiscuous mode becomes active and decodes current-channel telemetry, but
-   only one peer was present. Add sender-MAC framing if attribution across
-   multiple visible peers is needed.
+6. ~~**Multi-peer promiscuous attribution.**~~ Done — promiscuous frames
+   now ship as `MSP_WAYBEAM_SNIFFED_CRSF` (`0x0043`) carrying the source MAC
+   plus RSSI/channel from `rx_ctrl`.
+7. **Channel hopping.** Optional `channel_hop` bit in
+   `MSP_WAYBEAM_SNIFFER_CTRL`'s flags byte that, when set together with
+   `mode = promiscuous`, rotates channels 1/6/11 every ~250 ms so TXes
+   parked off channel 1 are still discovered. Not implemented; ELRS
+   Backpack itself only uses channel 1.
 
 ## Files touched
 
-- `lib/MSP/msptypes.h` — `MSP_WAYBEAM_SNIFFER_CTRL` (`0x0042`)
+- `lib/MSP/msptypes.h` — `MSP_WAYBEAM_SNIFFER_CTRL` (`0x0042`),
+  `MSP_WAYBEAM_SNIFFED_CRSF` (`0x0043`)
 - `targets/txbp_esp.ini` — `env:ESP32C3_TX_Backpack_via_USB` sniffer timing flags
-- `src/Tx_main.cpp` — runtime sniffer mode control and staged USB-CDC sniffer drain
+- `src/Tx_main.cpp` — runtime sniffer mode control, staged USB-CDC sniffer drain,
+  and `MSP_WAYBEAM_SNIFFED_CRSF` wrapping of promiscuous frames with
+  `src_mac + rssi + channel`
 - `docs/esp32c3_usb_backpack.md` — this file
 
 ## Branch

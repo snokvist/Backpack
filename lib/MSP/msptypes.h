@@ -29,6 +29,7 @@
 
 // Waybeam local extension opcodes
 #define MSP_WAYBEAM_SNIFFER_CTRL                0x42
+#define MSP_WAYBEAM_SNIFFED_CRSF                0x43
 
 // CRSF encapsulated msp defines
 #define ENCAPSULATED_MSP_PAYLOAD_SIZE           4
