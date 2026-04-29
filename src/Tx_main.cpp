@@ -16,6 +16,7 @@
 #include "common.h"
 #include "options.h"
 #include "helpers.h"
+#include "crc.h"
 
 #include "device.h"
 #include "devWIFI.h"
@@ -49,7 +50,7 @@ unsigned long rebootTime = 0;
     #define USB_SNIFFER_QUIET_AFTER_RX_MS 0
   #endif
 
-static constexpr size_t USB_SNIFFER_MAX_FRAME_SIZE = 260;
+static constexpr size_t USB_SNIFFER_MAX_FRAME_SIZE = 280;
 static constexpr uint8_t USB_SNIFFER_MODE_OFF = 0;
 static constexpr uint8_t USB_SNIFFER_MODE_BOUND = 1;
 static constexpr uint8_t USB_SNIFFER_MODE_PROMISCUOUS = 2;
@@ -106,11 +107,65 @@ static bool IsBoundPeer(const uint8_t *mac_addr)
          firmwareOptions.uid[5] == mac_addr[5];
 }
 
-static bool ShouldSniffEspnowCallbackFrame(const uint8_t *mac_addr)
+static uint8_t crc8_dvb(uint8_t crc, uint8_t b)
 {
-  uint8_t mode = sniff_mode;
-  return mode == USB_SNIFFER_MODE_PROMISCUOUS ||
-         (mode == USB_SNIFFER_MODE_BOUND && IsBoundPeer(mac_addr));
+  static GENERIC_CRC8 crc8_dvb_instance(0xD5);
+  return crc8_dvb_instance.calc(crc ^ b);
+}
+
+// Build a $X> MSP V2 frame for MSP_WAYBEAM_SNIFFED_CRSF directly into the
+// staging buffer. Payload layout: mac(6) | rssi(1) | channel(1) | crsf_frame[N].
+static void StageSniffedCrsfFrame(const uint8_t *src_mac,
+                                  int8_t rssi,
+                                  uint8_t channel,
+                                  const uint8_t *payload,
+                                  size_t payload_len)
+{
+  size_t inner_size = 8 + payload_len;
+  // $X> + flags(1)+function(2)+payloadSize(2) + inner + crc(1)
+  size_t total = 3 + 5 + inner_size + 1;
+  if (inner_size > 0xFFFF || total > USB_SNIFFER_MAX_FRAME_SIZE)
+  {
+    return;
+  }
+
+  uint8_t buf[USB_SNIFFER_MAX_FRAME_SIZE];
+  size_t pos = 0;
+  buf[pos++] = '$';
+  buf[pos++] = 'X';
+  buf[pos++] = '>';
+
+  uint8_t crc = 0;
+  uint8_t hdr[5];
+  hdr[0] = 0; // flags
+  hdr[1] = MSP_WAYBEAM_SNIFFED_CRSF & 0xFF;
+  hdr[2] = (MSP_WAYBEAM_SNIFFED_CRSF >> 8) & 0xFF;
+  hdr[3] = inner_size & 0xFF;
+  hdr[4] = (inner_size >> 8) & 0xFF;
+  for (size_t i = 0; i < sizeof(hdr); ++i)
+  {
+    buf[pos++] = hdr[i];
+    crc = crc8_dvb(crc, hdr[i]);
+  }
+
+  for (size_t i = 0; i < 6; ++i)
+  {
+    buf[pos++] = src_mac[i];
+    crc = crc8_dvb(crc, src_mac[i]);
+  }
+  uint8_t rssi_byte = (uint8_t)rssi;
+  buf[pos++] = rssi_byte;
+  crc = crc8_dvb(crc, rssi_byte);
+  buf[pos++] = channel;
+  crc = crc8_dvb(crc, channel);
+  for (size_t i = 0; i < payload_len; ++i)
+  {
+    buf[pos++] = payload[i];
+    crc = crc8_dvb(crc, payload[i]);
+  }
+  buf[pos++] = crc;
+
+  StageSniffPayload(buf, pos);
 }
 
 static const uint8_t *FindEspnowPayloadInActionFrame(const uint8_t *frame,
@@ -179,12 +234,24 @@ static void OnPromiscuousDataRecv(void *buf, wifi_promiscuous_pkt_type_t type)
     frame_len -= 4; // sig_len includes FCS; payload buffer does not expose it.
   }
 
+  // 802.11 mgmt frames place the source address at offset 10..15.
+  if (frame_len < 16)
+  {
+    return;
+  }
+
   size_t payload_len = 0;
   const uint8_t *payload = FindEspnowPayloadInActionFrame(packet->payload, frame_len, &payload_len);
-  if (payload != nullptr)
+  if (payload == nullptr)
   {
-    StageSniffPayload(payload, payload_len);
+    return;
   }
+
+  const uint8_t *src_mac = &packet->payload[10];
+  int8_t rssi = packet->rx_ctrl.rssi;
+  uint8_t channel = packet->rx_ctrl.channel;
+
+  StageSniffedCrsfFrame(src_mac, rssi, channel, payload, payload_len);
 }
 
 static void ApplySnifferMode(uint8_t requested_mode)
@@ -302,8 +369,15 @@ void OnDataRecv(const uint8_t * mac_addr, const uint8_t *data, int data_len)
   // We DO NOT call Serial.write from this WiFi-task callback because on
   // the C3's single core that starves the main loop's Serial.read,
   // breaking host->firmware MSP injection. memcpy + flag is microseconds.
+  //
+  // In PROMISCUOUS mode we don't stage from this callback at all — the
+  // ESP32 Wi-Fi promiscuous callback (OnPromiscuousDataRecv) already sees
+  // every ESP-NOW frame on the channel, has access to rx rssi/channel,
+  // and emits MSP_WAYBEAM_SNIFFED_CRSF frames with the src_mac extracted
+  // from the 802.11 header. Staging from both callbacks would race and
+  // overwrite each other in the single-frame buffer.
   bool bound_peer = IsBoundPeer(mac_addr);
-  if (ShouldSniffEspnowCallbackFrame(mac_addr))
+  if (sniff_mode == USB_SNIFFER_MODE_BOUND && bound_peer)
   {
     StageSniffPayload(data, static_cast<size_t>(data_len));
   }
