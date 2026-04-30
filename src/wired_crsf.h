@@ -53,5 +53,15 @@ bool WiredCrsfTakeStaged(size_t *len, uint8_t *out, size_t out_max);
 void WiredCrsfInjectFromHost(const uint8_t *crsf_frame, size_t len);
 // Read-only view for the OLED dashboard.
 const WiredCrsfStats &WiredCrsfGetStats();
+// Runtime enable/disable of the wired-CRSF receiver path (UART1 polling
+// + USB-CDC drainer). Persisted to NVS so a `disable` survives reboot.
+// When disabled, the bridge is fully quiet — no UART1 reads, no
+// `MSP_WAYBEAM_WIRED_CRSF` (0x0044) frames emitted, no Serial.write
+// calls from this path. Useful as a triage knob (the heavy USB-CDC
+// outbound traffic from the drainer at 50 Hz appears to interfere with
+// ESP-NOW outbound on the C3's single core) and as a real feature for
+// deployments without a wired receiver.
+void WiredCrsfSetEnabled(bool enabled);
+bool WiredCrsfIsEnabled();
 
 #endif // USB_WIRED_CRSF_ENABLED

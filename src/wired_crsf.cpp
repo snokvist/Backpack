@@ -3,6 +3,7 @@
 #if defined(USB_WIRED_CRSF_ENABLED)
 
 #include <Arduino.h>
+#include <Preferences.h>
 #include <string.h>
 #include "msptypes.h"
 #include "crc.h"
@@ -41,6 +42,14 @@ static WiredCrsfStats gStats = {};
 // Rate window (1 s)
 static uint32_t gRateWindowStartMs = 0;
 static uint32_t gRateWindowCount = 0;
+
+// Runtime enable flag, persisted to NVS namespace `waybeam_bp` key
+// `wired_en`. Default true (preserves current behaviour). When false:
+// WiredCrsfPoll returns immediately, no UART1 reads, no frames staged,
+// no `MSP_WAYBEAM_WIRED_CRSF` emit.
+static bool gEnabled = true;
+static constexpr const char *kPrefsNs  = "waybeam_bp";
+static constexpr const char *kPrefsKey = "wired_en";
 
 // CRC8 DVB-S2 (poly 0xD5) — same polynomial as the canonical CRSF impl.
 // Local instance keeps this module self-contained; runtime-built table is
@@ -193,6 +202,16 @@ static void TryParse()
 
 void WiredCrsfInit()
 {
+  // Restore the runtime enable flag from NVS before opening UART1, so a
+  // disabled-on-reboot config can skip the UART init entirely.
+  {
+    Preferences prefs;
+    if (prefs.begin(kPrefsNs, /*read-only=*/true))
+    {
+      gEnabled = prefs.getBool(kPrefsKey, true);
+      prefs.end();
+    }
+  }
   gWiredUart.setRxBufferSize(512);
   gWiredUart.begin(USB_WIRED_CRSF_BAUD, SERIAL_8N1,
                    USB_WIRED_CRSF_RX_PIN, USB_WIRED_CRSF_TX_PIN);
@@ -205,9 +224,37 @@ void WiredCrsfInit()
   gRateWindowCount = 0;
 }
 
+void WiredCrsfSetEnabled(bool enabled)
+{
+  gEnabled = enabled;
+  // Persist immediately so a host-side `disable` survives the next
+  // reboot. Cheap (the NVS commit only writes when the value differs)
+  // and not on a hot path.
+  Preferences prefs;
+  if (prefs.begin(kPrefsNs, /*read-only=*/false))
+  {
+    prefs.putBool(kPrefsKey, enabled);
+    prefs.end();
+  }
+  if (!enabled)
+  {
+    // Drop any in-flight RX state so a re-enable later doesn't replay
+    // stale bytes from before the disable.
+    gRxLen = 0;
+    gStagePending = false;
+    gStageLen = 0;
+  }
+}
+
+bool WiredCrsfIsEnabled()
+{
+  return gEnabled;
+}
+
 void WiredCrsfPoll()
 {
   if (!gReady) return;
+  if (!gEnabled) return;
 
   size_t budget = WIRED_RX_BYTES_PER_POLL;
   while (budget-- > 0 && gWiredUart.available() > 0)
