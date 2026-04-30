@@ -49,23 +49,11 @@ unsigned long rebootTime = 0;
   #define USB_CDC_SNIFFER_ENABLED 1
 #endif
 
-// last_host_rx_ms quiet-after-host gate is shared by sniffer + wired-CRSF
-// drainers — both need to back off briefly while a host MSP transaction is
-// in flight on the C3 USB-CDC.
+// Cumulative count of bytes received from the host on USB-CDC, exposed
+// to the OLED dashboard's "HST in" line. Single producer (the
+// Serial.read loop below), single consumer (the dashboard refresh).
 #if defined(USB_CDC_SNIFFER_ENABLED) || defined(USB_WIRED_CRSF_ENABLED)
-  #define USB_HOST_QUIET_GATE_ENABLED 1
-#endif
-
-#if defined(USB_HOST_QUIET_GATE_ENABLED)
-static unsigned long last_host_rx_ms = 0;
 static uint32_t host_in_bytes_total = 0;
-#endif
-
-#if defined(USB_WIRED_CRSF_ENABLED)
-  #ifndef USB_WIRED_CRSF_QUIET_AFTER_RX_MS
-    // Reuse the sniffer's host-quiet window so an inject + response can finish.
-    #define USB_WIRED_CRSF_QUIET_AFTER_RX_MS USB_SNIFFER_QUIET_AFTER_RX_MS
-  #endif
 #endif
 
 #if defined(PLATFORM_ESP32)
@@ -81,9 +69,6 @@ static float    espnow_rate_hz = 0.0f;
 #if defined(USB_CDC_SNIFFER_ENABLED)
   #ifndef USB_SNIFFER_MIN_GAP_MS
     #define USB_SNIFFER_MIN_GAP_MS 100
-  #endif
-  #ifndef USB_SNIFFER_QUIET_AFTER_RX_MS
-    #define USB_SNIFFER_QUIET_AFTER_RX_MS 0
   #endif
 
 static constexpr size_t USB_SNIFFER_MAX_FRAME_SIZE = 280;
@@ -857,10 +842,7 @@ void loop()
   if (Serial.available())
   {
     uint8_t c = Serial.read();
-#if defined(USB_HOST_QUIET_GATE_ENABLED)
-    // Tell the device->host drainers (sniffer + wired-CRSF) to back off
-    // briefly so a host->firmware MSP transaction can complete unimpeded.
-    last_host_rx_ms = millis();
+#if defined(USB_CDC_SNIFFER_ENABLED) || defined(USB_WIRED_CRSF_ENABLED)
     host_in_bytes_total++;
 #endif
 
@@ -884,22 +866,23 @@ void loop()
     sendCached = false;
   }
 
-#if defined(USB_HOST_QUIET_GATE_ENABLED)
-  // Single host-quiet gate shared by both drainers below.
+#if defined(USB_CDC_SNIFFER_ENABLED) || defined(USB_WIRED_CRSF_ENABLED)
+  // Skip a drain tick while the MSP byte-parser is mid-frame so a
+  // host->firmware request never gets interleaved with a device->host
+  // emit. Replaces an earlier 500 ms timer-based gate that locked
+  // permanently under sustained host writes (e.g. continuous PTR
+  // streaming at 25 Hz from the Android app). Parser state is the
+  // exact original intent: don't write while a host MSP transaction is
+  // in progress.
   unsigned long now_ms = millis();
-  bool host_rx_active = false;
-  #if defined(USB_CDC_SNIFFER_ENABLED)
-    host_rx_active = (now_ms - last_host_rx_ms) < USB_SNIFFER_QUIET_AFTER_RX_MS;
-  #endif
+  bool host_in_frame = msp.frameInProgress();
 #endif
 
 #if defined(USB_CDC_SNIFFER_ENABLED)
   // Drain the staged ESP-NOW payload into Serial here — same task as
-  // Serial.read above, so they don't fight. Throttle to USB_SNIFFER_MIN_GAP_MS
-  // and pause for USB_SNIFFER_QUIET_AFTER_RX_MS after the host last sent us
-  // bytes so an inject + response can finish unimpeded.
+  // Serial.read above, so they don't fight. Throttled to USB_SNIFFER_MIN_GAP_MS.
   static unsigned long last_sniff_ms = 0;
-  if ((now_ms - last_sniff_ms) >= USB_SNIFFER_MIN_GAP_MS && !host_rx_active) {
+  if ((now_ms - last_sniff_ms) >= USB_SNIFFER_MIN_GAP_MS && !host_in_frame) {
     size_t len = 0;
     if (TakeSniffPayload(&len)) {
       if (Serial.availableForWrite() >= (int)len) {
@@ -915,10 +898,10 @@ void loop()
   WiredCrsfPoll();
 
   // Drain wired-CRSF staged frames with their own gap timer. Tighter than
-  // the sniffer (15 ms vs. 100 ms) because RC at 50 Hz needs ~20 ms cadence
+  // the sniffer (5 ms vs. 100 ms) because RC at 50 Hz needs ~20 ms cadence
   // and these are deterministic 26-byte frames, not promiscuous spam.
   static unsigned long last_wired_drain_ms = 0;
-  if ((now_ms - last_wired_drain_ms) >= USB_WIRED_CRSF_MIN_GAP_MS && !host_rx_active) {
+  if ((now_ms - last_wired_drain_ms) >= USB_WIRED_CRSF_MIN_GAP_MS && !host_in_frame) {
     static uint8_t wired_out[WIRED_CRSF_MSP_MAX_BYTES];
     size_t len = 0;
     if (WiredCrsfTakeStaged(&len, wired_out, sizeof(wired_out))) {
@@ -958,7 +941,7 @@ void loop()
     s.sniff_mode           = sniff_mode;
     s.sniff_promisc_active = sniff_promiscuous_active;
   #endif
-  #if defined(USB_HOST_QUIET_GATE_ENABLED)
+  #if defined(USB_CDC_SNIFFER_ENABLED) || defined(USB_WIRED_CRSF_ENABLED)
     s.host_in_bytes  = host_in_bytes_total;
   #endif
     s.host_out_bytes = 0; // not tracked yet

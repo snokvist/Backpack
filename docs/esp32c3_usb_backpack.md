@@ -63,8 +63,7 @@ main loop. The sniffer is compiled in but disabled at boot.
 ```
 -D ARDUINO_USB_CDC_ON_BOOT=1
 -D USB_SNIFFER=1
--D USB_SNIFFER_MIN_GAP_MS=1000
--D USB_SNIFFER_QUIET_AFTER_RX_MS=500
+-D USB_SNIFFER_MIN_GAP_MS=100
 ```
 
 `ARDUINO_USB_CDC_ON_BOOT` makes `Serial` resolve to the C3's built-in
@@ -138,7 +137,9 @@ by a short ESP32 critical section. `loop()` drains that buffer to `Serial`
 after:
 
 - `USB_SNIFFER_MIN_GAP_MS` has elapsed since the last sniffer drain.
-- `USB_SNIFFER_QUIET_AFTER_RX_MS` has elapsed since the host last sent a byte.
+- The MSP byte-parser is not currently mid-frame (`msp.frameInProgress()`
+  is false). This skips a tick if a host->firmware MSP request is in
+  flight, so device->host emits never get interleaved mid-request.
 
 Bytes are MSP-framed already; a host-side MSP v2 parser decodes them directly.
 In `bound` mode the staged bytes are the raw inbound ESP-NOW frame (typically
@@ -398,11 +399,20 @@ MSP-encapsulated (`0x7A / 0x7B`). The host dispatches by frame type.
 | Sniffer (`0x0043`) | `USB_SNIFFER_MIN_GAP_MS = 100 ms` | 10 Hz |
 | Wired CRSF (`0x0044`) | `USB_WIRED_CRSF_MIN_GAP_MS = 5 ms` | 200 Hz |
 
-Both honour `last_host_rx_ms` (500 ms post-host-RX quiet) so a host MSP
-transaction is never disrupted. Single-slot drop-oldest staging:
-drainer rate = max emit rate. With 5 ms gap the wired path passes
-50 / 100 / 150 / 250 Hz CRSF link rates without drops. 500 Hz needs
-2 ms — override `USB_WIRED_CRSF_MIN_GAP_MS` per env if needed.
+Both honour `msp.frameInProgress()` so a host MSP request is never
+interleaved with a device->host emit mid-frame. Single-slot drop-oldest
+staging: drainer rate = max emit rate. With 5 ms gap the wired path
+passes 50 / 100 / 150 / 250 Hz CRSF link rates without drops. 500 Hz
+needs 2 ms — override `USB_WIRED_CRSF_MIN_GAP_MS` per env if needed.
+
+The earlier 500 ms timer-based gate (`USB_SNIFFER_QUIET_AFTER_RX_MS`,
+shared between sniffer and wired drainers) was removed because it locked
+permanently under sustained host writes — a continuous 25 Hz
+`MSP_ELRS_BACKPACK_SET_PTR` stream from the Android app reset the
+`last_host_rx_ms` timer on every byte and starved both drainers
+indefinitely. The parser-state predicate is rate-independent and
+captures the original intent ("don't write while a host transaction is
+in progress") exactly.
 
 ### Sliding-window parser
 
@@ -491,6 +501,7 @@ the next dashboard tick (200 ms later) overwrites it with live data.
 - `src/oled_dashboard.{h,cpp}` — 128 × 64 SSD1306 dashboard, mono / dual
   layout, runtime toggle persistence
 - `lib/BUTTON/devButton.cpp` — `OnLongPress` → OLED layout toggle
-- `src/Tx_main.cpp` — broadened host-quiet gate (sniffer + wired share
-  it), inject MSP handler, ESP-NOW rate counter, NVS read at boot
+- `src/Tx_main.cpp` — parser-state-predicated host-frame gate (sniffer +
+  wired share it via `msp.frameInProgress()`), inject MSP handler,
+  ESP-NOW rate counter, NVS read at boot
 - `CLAUDE.md` — new sections for wired-CRSF + OLED toggle
