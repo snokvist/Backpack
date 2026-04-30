@@ -30,6 +30,8 @@
 // Waybeam local extension opcodes
 #define MSP_WAYBEAM_SNIFFER_CTRL                0x42
 #define MSP_WAYBEAM_SNIFFED_CRSF                0x43
+#define MSP_WAYBEAM_WIRED_CRSF                  0x44 // device -> host: raw CRSF frame from GPIO20 RX
+#define MSP_WAYBEAM_INJECT_CRSF                 0x45 // host -> device: raw CRSF frame to emit on GPIO21 TX
 
 // CRSF encapsulated msp defines
 #define ENCAPSULATED_MSP_PAYLOAD_SIZE           4

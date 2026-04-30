@@ -23,6 +23,9 @@
 #include "devButton.h"
 #include "devLED.h"
 
+#include "wired_crsf.h"
+#include "oled_dashboard.h"
+
 #if defined(MAVLINK_ENABLED)
 #include <MAVLink.h>
 #endif
@@ -40,6 +43,35 @@ unsigned long rebootTime = 0;
 
 #if defined(USB_SNIFFER) && defined(ARDUINO_USB_CDC_ON_BOOT) && defined(PLATFORM_ESP32) && !defined(USB_SNIFFER_DISABLE_FOR_TEST)
   #define USB_CDC_SNIFFER_ENABLED 1
+#endif
+
+// last_host_rx_ms quiet-after-host gate is shared by sniffer + wired-CRSF
+// drainers — both need to back off briefly while a host MSP transaction is
+// in flight on the C3 USB-CDC.
+#if defined(USB_CDC_SNIFFER_ENABLED) || defined(USB_WIRED_CRSF_ENABLED)
+  #define USB_HOST_QUIET_GATE_ENABLED 1
+#endif
+
+#if defined(USB_HOST_QUIET_GATE_ENABLED)
+static unsigned long last_host_rx_ms = 0;
+static uint32_t host_in_bytes_total = 0;
+#endif
+
+#if defined(USB_WIRED_CRSF_ENABLED)
+  #ifndef USB_WIRED_CRSF_QUIET_AFTER_RX_MS
+    // Reuse the sniffer's host-quiet window so an inject + response can finish.
+    #define USB_WIRED_CRSF_QUIET_AFTER_RX_MS USB_SNIFFER_QUIET_AFTER_RX_MS
+  #endif
+#endif
+
+#if defined(PLATFORM_ESP32)
+// ESP-NOW RX rate stats for the dashboard (single producer in OnDataRecv,
+// single consumer in loop — uint32_t reads/writes are atomic on the C3).
+static volatile uint32_t espnow_rx_packet_count = 0;
+static volatile uint32_t espnow_last_rx_ms = 0;
+static uint32_t espnow_rate_window_start_ms = 0;
+static uint32_t espnow_rate_window_count = 0;
+static float    espnow_rate_hz = 0.0f;
 #endif
 
 #if defined(USB_CDC_SNIFFER_ENABLED)
@@ -63,7 +95,6 @@ static uint8_t sniff_buf[USB_SNIFFER_MAX_FRAME_SIZE];
 static uint8_t sniff_write_buf[USB_SNIFFER_MAX_FRAME_SIZE];
 static size_t sniff_len = 0;
 static bool sniff_pending = false;
-static unsigned long last_host_rx_ms = 0;
 static portMUX_TYPE sniff_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static void StageSniffPayload(const uint8_t *data, size_t len)
@@ -364,6 +395,12 @@ void OnDataRecv(uint8_t * mac_addr, uint8_t *data, uint8_t data_len)
 void OnDataRecv(const uint8_t * mac_addr, const uint8_t *data, int data_len)
 #endif
 {
+#if defined(PLATFORM_ESP32)
+  // Bump ESP-NOW RX counter for the OLED dashboard (any packet from any peer
+  // hitting our STA MAC counts; bound vs. unbound is a separate concern).
+  espnow_rx_packet_count++;
+  espnow_last_rx_ms = millis();
+#endif
 #if defined(USB_CDC_SNIFFER_ENABLED)
   // Stage the latest ESP-NOW payload for the main loop to write out.
   // We DO NOT call Serial.write from this WiFi-task callback because on
@@ -508,6 +545,15 @@ void ProcessMSPPacketFromTX(mspPacket_t *packet)
       ApplySnifferMode(packet->payload[0]);
     }
     SendSnifferAck();
+    break;
+#endif
+
+#if defined(USB_WIRED_CRSF_ENABLED)
+  case MSP_WAYBEAM_INJECT_CRSF:
+    // Host -> wire: forward the verbatim CRSF frame onto GPIO21 TX.
+    // Validation (length consistency + CRC8 DVB-S2) lives in the module so
+    // a malformed host frame can never blast garbage onto the receiver UART.
+    WiredCrsfInjectFromHost(packet->payload, packet->payloadSize);
     break;
 #endif
 
@@ -765,6 +811,15 @@ void setup()
   {
     connectionState = running;
   }
+
+#if defined(USB_WIRED_CRSF_ENABLED)
+  WiredCrsfInit();
+#endif
+
+#if defined(OLED_DASHBOARD_ENABLED)
+  OledDashboardInit();
+#endif
+
   DBGLN("Setup completed");
 }
 
@@ -784,11 +839,11 @@ void loop()
   if (Serial.available())
   {
     uint8_t c = Serial.read();
-#if defined(USB_CDC_SNIFFER_ENABLED)
-    // Tell the sniffer (running on the WiFi task) to back off briefly so
-    // host->firmware MSP injection + the response can complete without
-    // the sniffer hogging the USB controller.
+#if defined(USB_HOST_QUIET_GATE_ENABLED)
+    // Tell the device->host drainers (sniffer + wired-CRSF) to back off
+    // briefly so a host->firmware MSP transaction can complete unimpeded.
     last_host_rx_ms = millis();
+    host_in_bytes_total++;
 #endif
 
     // Try to parse MSP packets from the TX
@@ -811,14 +866,21 @@ void loop()
     sendCached = false;
   }
 
+#if defined(USB_HOST_QUIET_GATE_ENABLED)
+  // Single host-quiet gate shared by both drainers below.
+  unsigned long now_ms = millis();
+  bool host_rx_active = false;
+  #if defined(USB_CDC_SNIFFER_ENABLED)
+    host_rx_active = (now_ms - last_host_rx_ms) < USB_SNIFFER_QUIET_AFTER_RX_MS;
+  #endif
+#endif
+
 #if defined(USB_CDC_SNIFFER_ENABLED)
   // Drain the staged ESP-NOW payload into Serial here — same task as
   // Serial.read above, so they don't fight. Throttle to USB_SNIFFER_MIN_GAP_MS
   // and pause for USB_SNIFFER_QUIET_AFTER_RX_MS after the host last sent us
   // bytes so an inject + response can finish unimpeded.
-  unsigned long now_ms = millis();
   static unsigned long last_sniff_ms = 0;
-  bool host_rx_active = (now_ms - last_host_rx_ms) < USB_SNIFFER_QUIET_AFTER_RX_MS;
   if ((now_ms - last_sniff_ms) >= USB_SNIFFER_MIN_GAP_MS && !host_rx_active) {
     size_t len = 0;
     if (TakeSniffPayload(&len)) {
@@ -827,6 +889,71 @@ void loop()
       }
       last_sniff_ms = now_ms;
     }
+  }
+#endif
+
+#if defined(USB_WIRED_CRSF_ENABLED)
+  // Pump the UART1 RX queue, validate frames, stage one at a time.
+  WiredCrsfPoll();
+
+  // Drain wired-CRSF staged frames with their own gap timer. Tighter than
+  // the sniffer (15 ms vs. 100 ms) because RC at 50 Hz needs ~20 ms cadence
+  // and these are deterministic 26-byte frames, not promiscuous spam.
+  static unsigned long last_wired_drain_ms = 0;
+  if ((now_ms - last_wired_drain_ms) >= USB_WIRED_CRSF_MIN_GAP_MS && !host_rx_active) {
+    static uint8_t wired_out[WIRED_CRSF_MSP_MAX_BYTES];
+    size_t len = 0;
+    if (WiredCrsfTakeStaged(&len, wired_out, sizeof(wired_out))) {
+      if (Serial.availableForWrite() >= (int)len) {
+        Serial.write(wired_out, len);
+      }
+      last_wired_drain_ms = now_ms;
+    }
+  }
+#endif
+
+#if defined(PLATFORM_ESP32)
+  // Update ESP-NOW rolling 1 s rate (read-side only — counter increments
+  // happen in OnDataRecv). Decay to 0 after 2 s of silence.
+  {
+    uint32_t pcnt = espnow_rx_packet_count;
+    uint32_t elapsed = millis() - espnow_rate_window_start_ms;
+    if (elapsed >= 1000) {
+      uint32_t delta = pcnt - espnow_rate_window_count;
+      espnow_rate_hz = (float)delta * 1000.0f / (float)elapsed;
+      espnow_rate_window_count = pcnt;
+      espnow_rate_window_start_ms = millis();
+    }
+    if ((millis() - espnow_last_rx_ms) > 2000) {
+      espnow_rate_hz = 0.0f;
+    }
+  }
+#endif
+
+#if defined(OLED_DASHBOARD_ENABLED)
+  {
+    OledLinkStats s = {};
+    s.espnow_rx_packets = espnow_rx_packet_count;
+    s.espnow_last_rx_ms = espnow_last_rx_ms;
+    s.espnow_rx_rate_hz = espnow_rate_hz;
+  #if defined(USB_CDC_SNIFFER_ENABLED)
+    s.sniff_mode           = sniff_mode;
+    s.sniff_promisc_active = sniff_promiscuous_active;
+  #endif
+  #if defined(USB_HOST_QUIET_GATE_ENABLED)
+    s.host_in_bytes  = host_in_bytes_total;
+  #endif
+    s.host_out_bytes = 0; // not tracked yet
+    s.peer_mac       = firmwareOptions.uid;
+  #if defined(PLATFORM_ESP32)
+    {
+      uint8_t pri = 0;
+      wifi_second_chan_t sec;
+      esp_wifi_get_channel(&pri, &sec);
+      s.primary_channel = pri;
+    }
+  #endif
+    OledDashboardLoop(millis(), s);
   }
 #endif
 }

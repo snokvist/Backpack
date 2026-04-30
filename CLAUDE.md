@@ -109,6 +109,66 @@ during a host MSP transaction stucks the C3 USB-CDC**. Throttling alone
 isn't enough — the gate must auto-pause around request/response
 round-trips. See `backpack_pr2_merged.md` in coordination memory.
 
+## Wired CRSF bridge (USB env only)
+
+GPIO 20 (RX) / GPIO 21 (TX) carry a standard CRSF UART at 420 000 8N1.
+Wire an ELRS receiver's tx pad to GPIO 20 to feed RC channels into the
+host; wire its rx pad to GPIO 21 to forward host-injected telemetry
+back. Either pin can stay disconnected — the firmware never asserts a
+pin that isn't used.
+
+| MSP function | Direction | Payload |
+|---|---|---|
+| `MSP_WAYBEAM_WIRED_CRSF` (`0x0044`) | device → host | full CRSF frame (`addr`, `len`, `type`, `payload`, `crc8`) verbatim |
+| `MSP_WAYBEAM_INJECT_CRSF` (`0x0045`) | host → device | full CRSF frame; firmware re-validates CRC before emitting on UART1 |
+
+All CRSF frame types are forwarded — RC channels (`0x16`), link
+statistics (`0x14`), telemetry (`0x02/0x07/0x08`...), MSP-encapsulated
+(`0x7A/0x7B`). Bridge is **always-on at boot** (no host opt-in
+required).
+
+Drainer separation in `loop()`:
+
+- Sniffer slot: 100 ms minimum gap, 500 ms post-host-RX quiet — tuned
+  for promiscuous ESP-NOW spam.
+- Wired-CRSF slot: 15 ms minimum gap, same 500 ms post-host-RX quiet —
+  needed to keep 50 Hz RC at usable cadence (≥33 Hz worst case).
+
+Both share the `last_host_rx_ms` quiet gate (the load-bearing rule that
+keeps host-MSP transactions from getting stucked).
+
+The wired-CRSF module reuses `GENERIC_CRC8(0xD5)` from `lib/CRC` — same
+polynomial as the canonical CRSF DVB-S2 table; no new CRC table.
+Frames are forwarded verbatim, so the 4-implementation drift list
+(`/audit-protocols`) stays at 4.
+
+## OLED dashboard (USB env only)
+
+Optional 128 × 64 SSD1306 on I²C: SDA=GPIO 4, SCL=GPIO 5, addr 0x3C.
+Init failure (no OLED soldered) silently disables the dashboard — no
+panic, no missing-display retries.
+
+Layout (refreshed every 200 ms from `loop()`):
+
+```
+┌──────────────────────────────────────┐
+│ Waybeam BP-USB              123KB    │  header (free heap)
+├──────────────────────────────────────┤
+│ ESP 49.5Hz ch11 BND                  │  ESP-NOW rx rate, channel, sniffer mode
+│ p aabbccddeeff                       │  bound peer MAC
+├──────────────────────────────────────┤
+│ WIR 49.8Hz t16 e0                    │  wired CRSF rx rate, last frame type, error count
+│ 1500 1500 1000 1500                  │  RC ch1-4 in microseconds (when type=0x16 fresh)
+├──────────────────────────────────────┤
+│ HST in 1234 out 0                    │  host bytes in/out
+│ inj 87  00:14:31                     │  inject count, uptime
+└──────────────────────────────────────┘
+```
+
+Adafruit SSD1306 + GFX libs add ~36 KB flash; only built into
+`ESP32C3_TX_Backpack_via_USB`. Stock UART/ETX/WIFI envs are byte-identical
+to before this PR.
+
 ## Conventions specific to this fork
 
 - All Waybeam PRs go to `snokvist/Backpack`, never upstream `ExpressLRS/Backpack`.
