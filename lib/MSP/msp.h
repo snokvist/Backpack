@@ -90,6 +90,12 @@ class MSP
 public:
     MSP();
     bool            processReceivedByte(uint8_t c);
+    /** True while the byte parser is mid-frame (i.e. has consumed at
+     *  least the magic byte but not yet validated the CRC and emitted a
+     *  packet). Used by USB-CDC drainers on the ESP32C3 USB env to skip a
+     *  device->host emit so a host->firmware MSP transaction is never
+     *  interleaved mid-frame. */
+    bool            frameInProgress() const { return m_inputState != MSP_IDLE; }
     mspPacket_t*    getReceivedPacket();
     void            markPacketReceived();
     bool            sendPacket(mspPacket_t* packet, Stream* port);

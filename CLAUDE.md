@@ -104,10 +104,12 @@ sniffer protocol.
 
 Sniffer mode is host-driven via `MSP_WAYBEAM_SNIFFER_CTRL` (`0x0042`).
 Default at boot is OFF (no `Serial.write` from sniffer path until host
-opts in). The runtime gate exists because **any device-side `Serial.write`
-during a host MSP transaction stucks the C3 USB-CDC**. Throttling alone
-isn't enough — the gate must auto-pause around request/response
-round-trips. See `backpack_pr2_merged.md` in coordination memory.
+opts in). The runtime gate originally existed because pre-arduino-esp32
+v2.0.17 had a simultaneous-TX+RX bug on C3 USB-CDC: any device-side
+`Serial.write` during a host MSP transaction could stuck the bus. v2.0.17
+(PR #5) fixed that, and the timer-based 500 ms gate that replaced it has
+since been replaced by an exact parser-state predicate (`msp.frameInProgress()`)
+— see "Drainer host-frame gate" below.
 
 ## Wired CRSF bridge (USB env only)
 
@@ -129,14 +131,32 @@ required).
 
 Drainer separation in `loop()`:
 
-- Sniffer slot: 100 ms minimum gap, 500 ms post-host-RX quiet — tuned
-  for promiscuous ESP-NOW spam.
-- Wired-CRSF slot: 5 ms minimum gap, same 500 ms post-host-RX quiet —
-  passes 50/100/150/250 Hz RC links without drops (single-slot
-  drop-oldest staging means drainer rate = max emit rate).
+- Sniffer slot: 100 ms minimum gap — tuned for promiscuous ESP-NOW spam.
+- Wired-CRSF slot: 5 ms minimum gap — passes 50/100/150/250 Hz RC links
+  without drops (single-slot drop-oldest staging means drainer rate =
+  max emit rate).
 
-Both share the `last_host_rx_ms` quiet gate (the load-bearing rule that
-keeps host-MSP transactions from getting stucked).
+### Drainer host-frame gate
+
+Both drainers skip a tick while the MSP byte-parser is mid-frame, via
+`msp.frameInProgress()` (returns true between magic byte and CRC). This
+replaces an earlier 500 ms timer-based gate (`USB_SNIFFER_QUIET_AFTER_RX_MS`)
+that locked permanently under sustained host writes — e.g. continuous
+25 Hz `MSP_ELRS_BACKPACK_SET_PTR` from the Android app reset the timer
+on every byte and starved every device→host emit path. The parser-state
+predicate is:
+
+- **Exact original intent**: only block while a host transaction is
+  actually in flight, not for an arbitrary tail window after.
+- **Rate-independent**: handles 1 Hz one-shots and 100 Hz streams the
+  same way — no rate cliff to retune.
+- **Self-correcting for new emit paths**: any future device→host
+  channel that respects this predicate cannot reintroduce the bug.
+
+Response-side writes (e.g. `msp.sendPacket(..., &Serial)` from
+`ProcessMSPPacketFromTX`) are naturally serialised through `loop()` so
+no special handling is needed; the drainer check happens only after
+the response Serial.write returns.
 
 Inbound parsing is a sliding-window CRSF parser: on CRC mismatch the
 window slides one byte and retries, so a single byte of drift no
