@@ -202,8 +202,10 @@ static void TryParse()
 
 void WiredCrsfInit()
 {
-  // Restore the runtime enable flag from NVS before opening UART1, so a
-  // disabled-on-reboot config can skip the UART init entirely.
+  // Restore the runtime enable flag from NVS before opening UART1.
+  // When disabled-on-reboot the UART is never attached at boot — no
+  // pin assignment, no RX ISR — which the runtime A/B test relies on
+  // to truly silence the path.
   {
     Preferences prefs;
     if (prefs.begin(kPrefsNs, /*read-only=*/true))
@@ -212,20 +214,25 @@ void WiredCrsfInit()
       prefs.end();
     }
   }
-  gWiredUart.setRxBufferSize(512);
-  gWiredUart.begin(USB_WIRED_CRSF_BAUD, SERIAL_8N1,
-                   USB_WIRED_CRSF_RX_PIN, USB_WIRED_CRSF_TX_PIN);
-  gReady = true;
   gRxLen = 0;
   gStagePending = false;
   gStageLen = 0;
   memset(&gStats, 0, sizeof(gStats));
   gRateWindowStartMs = millis();
   gRateWindowCount = 0;
+  if (gEnabled) {
+    gWiredUart.setRxBufferSize(512);
+    gWiredUart.begin(USB_WIRED_CRSF_BAUD, SERIAL_8N1,
+                     USB_WIRED_CRSF_RX_PIN, USB_WIRED_CRSF_TX_PIN);
+    gReady = true;
+  } else {
+    gReady = false;
+  }
 }
 
 void WiredCrsfSetEnabled(bool enabled)
 {
+  if (enabled == gEnabled) return;
   gEnabled = enabled;
   // Persist immediately so a host-side `disable` survives the next
   // reboot. Cheap (the NVS commit only writes when the value differs)
@@ -238,11 +245,29 @@ void WiredCrsfSetEnabled(bool enabled)
   }
   if (!enabled)
   {
-    // Drop any in-flight RX state so a re-enable later doesn't replay
-    // stale bytes from before the disable.
+    // Tear down UART1 fully — not just the app-level poll. Otherwise
+    // the hardware UART stays attached to GPIO20/21 and the RX ISR
+    // keeps firing on every byte the receiver sends. We're hunting an
+    // ESP-NOW-vs-UART-ISR concurrency issue; the disable has to be a
+    // real hardware off-switch for the A/B test to be honest.
+    gWiredUart.end();
+    gReady = false;
     gRxLen = 0;
     gStagePending = false;
     gStageLen = 0;
+  }
+  else
+  {
+    // Re-attach UART1. Mirror WiredCrsfInit's setup.
+    gWiredUart.setRxBufferSize(512);
+    gWiredUart.begin(USB_WIRED_CRSF_BAUD, SERIAL_8N1,
+                     USB_WIRED_CRSF_RX_PIN, USB_WIRED_CRSF_TX_PIN);
+    gReady = true;
+    gRxLen = 0;
+    gStagePending = false;
+    gStageLen = 0;
+    gRateWindowStartMs = millis();
+    gRateWindowCount = 0;
   }
 }
 
