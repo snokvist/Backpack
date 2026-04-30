@@ -3,6 +3,7 @@
 #if defined(USB_WIRED_CRSF_ENABLED)
 
 #include <Arduino.h>
+#include <Preferences.h>
 #include <string.h>
 #include "msptypes.h"
 #include "crc.h"
@@ -41,6 +42,14 @@ static WiredCrsfStats gStats = {};
 // Rate window (1 s)
 static uint32_t gRateWindowStartMs = 0;
 static uint32_t gRateWindowCount = 0;
+
+// Runtime enable flag, persisted to NVS namespace `waybeam_bp` key
+// `wired_en`. Default true (preserves current behaviour). When false:
+// WiredCrsfPoll returns immediately, no UART1 reads, no frames staged,
+// no `MSP_WAYBEAM_WIRED_CRSF` emit.
+static bool gEnabled = true;
+static constexpr const char *kPrefsNs  = "waybeam_bp";
+static constexpr const char *kPrefsKey = "wired_en";
 
 // CRC8 DVB-S2 (poly 0xD5) — same polynomial as the canonical CRSF impl.
 // Local instance keeps this module self-contained; runtime-built table is
@@ -193,21 +202,84 @@ static void TryParse()
 
 void WiredCrsfInit()
 {
-  gWiredUart.setRxBufferSize(512);
-  gWiredUart.begin(USB_WIRED_CRSF_BAUD, SERIAL_8N1,
-                   USB_WIRED_CRSF_RX_PIN, USB_WIRED_CRSF_TX_PIN);
-  gReady = true;
+  // Restore the runtime enable flag from NVS before opening UART1.
+  // When disabled-on-reboot the UART is never attached at boot — no
+  // pin assignment, no RX ISR — which the runtime A/B test relies on
+  // to truly silence the path.
+  {
+    Preferences prefs;
+    if (prefs.begin(kPrefsNs, /*read-only=*/true))
+    {
+      gEnabled = prefs.getBool(kPrefsKey, true);
+      prefs.end();
+    }
+  }
   gRxLen = 0;
   gStagePending = false;
   gStageLen = 0;
   memset(&gStats, 0, sizeof(gStats));
   gRateWindowStartMs = millis();
   gRateWindowCount = 0;
+  if (gEnabled) {
+    gWiredUart.setRxBufferSize(512);
+    gWiredUart.begin(USB_WIRED_CRSF_BAUD, SERIAL_8N1,
+                     USB_WIRED_CRSF_RX_PIN, USB_WIRED_CRSF_TX_PIN);
+    gReady = true;
+  } else {
+    gReady = false;
+  }
+}
+
+void WiredCrsfSetEnabled(bool enabled)
+{
+  if (enabled == gEnabled) return;
+  gEnabled = enabled;
+  // Persist immediately so a host-side `disable` survives the next
+  // reboot. Cheap (the NVS commit only writes when the value differs)
+  // and not on a hot path.
+  Preferences prefs;
+  if (prefs.begin(kPrefsNs, /*read-only=*/false))
+  {
+    prefs.putBool(kPrefsKey, enabled);
+    prefs.end();
+  }
+  if (!enabled)
+  {
+    // Tear down UART1 fully — not just the app-level poll. Otherwise
+    // the hardware UART stays attached to GPIO20/21 and the RX ISR
+    // keeps firing on every byte the receiver sends. We're hunting an
+    // ESP-NOW-vs-UART-ISR concurrency issue; the disable has to be a
+    // real hardware off-switch for the A/B test to be honest.
+    gWiredUart.end();
+    gReady = false;
+    gRxLen = 0;
+    gStagePending = false;
+    gStageLen = 0;
+  }
+  else
+  {
+    // Re-attach UART1. Mirror WiredCrsfInit's setup.
+    gWiredUart.setRxBufferSize(512);
+    gWiredUart.begin(USB_WIRED_CRSF_BAUD, SERIAL_8N1,
+                     USB_WIRED_CRSF_RX_PIN, USB_WIRED_CRSF_TX_PIN);
+    gReady = true;
+    gRxLen = 0;
+    gStagePending = false;
+    gStageLen = 0;
+    gRateWindowStartMs = millis();
+    gRateWindowCount = 0;
+  }
+}
+
+bool WiredCrsfIsEnabled()
+{
+  return gEnabled;
 }
 
 void WiredCrsfPoll()
 {
   if (!gReady) return;
+  if (!gEnabled) return;
 
   size_t budget = WIRED_RX_BYTES_PER_POLL;
   while (budget-- > 0 && gWiredUart.available() > 0)

@@ -57,6 +57,20 @@ static uint32_t host_in_bytes_total = 0;
 #endif
 
 #if defined(PLATFORM_ESP32)
+// ESP-NOW outbound counters. Surfaced on the OLED dashboard and via
+// MSP_WAYBEAM_DIAG (0x47). Useful for diagnosing why a peer (e.g. a TX
+// backpack receiving HT/PTR) suddenly stops getting packets even though
+// the host has been told to send: a non-zero `espnow_tx_fail` while
+// `espnow_tx_ok` plateaus is the WiFi-task TX queue rejecting sends,
+// which has been observed when heavy main-loop USB-CDC writes (e.g. the
+// wired-CRSF drainer at ~50 Hz) starve the WiFi task on the C3's single
+// core. `espnow_tx_last_err` is the last non-OK return code.
+static uint32_t espnow_tx_ok       = 0;
+static uint32_t espnow_tx_fail     = 0;
+static int32_t  espnow_tx_last_err = 0;
+#endif
+
+#if defined(PLATFORM_ESP32)
 // ESP-NOW RX rate stats for the dashboard (single producer in OnDataRecv,
 // single consumer in loop — uint32_t reads/writes are atomic on the C3).
 static volatile uint32_t espnow_rx_packet_count = 0;
@@ -544,6 +558,52 @@ void ProcessMSPPacketFromTX(mspPacket_t *packet)
     // a malformed host frame can never blast garbage onto the receiver UART.
     WiredCrsfInjectFromHost(packet->payload, packet->payloadSize);
     break;
+
+  case MSP_WAYBEAM_WIRED_CRSF_CTRL:
+    // host <-> device: query (empty payload) or set ([enable_byte]).
+    // Reply mirrors the current state so the host can confirm.
+    if (packet->payloadSize >= 1) {
+      WiredCrsfSetEnabled(packet->payload[0] != 0);
+    }
+    {
+      mspPacket_t out;
+      out.reset();
+      out.makeResponse();
+      out.function = MSP_WAYBEAM_WIRED_CRSF_CTRL;
+      out.addByte(WiredCrsfIsEnabled() ? 1 : 0);
+      msp.sendPacket(&out, &Serial);
+    }
+    break;
+#endif
+
+#if defined(PLATFORM_ESP32)
+  case MSP_WAYBEAM_DIAG: {
+    // Read-only diagnostic snapshot. Reply payload (little-endian):
+    //   espnow_tx_ok      u32
+    //   espnow_tx_fail    u32
+    //   espnow_tx_last_err i32
+    //   wired_crsf_enabled u8 (0/1; 0xFF if not built in)
+    mspPacket_t out;
+    out.reset();
+    out.makeResponse();
+    out.function = MSP_WAYBEAM_DIAG;
+    auto put_u32 = [&](uint32_t v) {
+      out.addByte( v        & 0xFF);
+      out.addByte((v >> 8)  & 0xFF);
+      out.addByte((v >> 16) & 0xFF);
+      out.addByte((v >> 24) & 0xFF);
+    };
+    put_u32(espnow_tx_ok);
+    put_u32(espnow_tx_fail);
+    put_u32((uint32_t)espnow_tx_last_err);
+#if defined(USB_WIRED_CRSF_ENABLED)
+    out.addByte(WiredCrsfIsEnabled() ? 1 : 0);
+#else
+    out.addByte(0xFF);
+#endif
+    msp.sendPacket(&out, &Serial);
+    break;
+  }
 #endif
 
   case MSP_ELRS_BACKPACK_SET_HEAD_TRACKING:
@@ -611,14 +671,25 @@ void sendMSPViaEspnow(mspPacket_t *packet)
     return;
   }
 
+  int err;
   if (packet->function == MSP_ELRS_BIND)
   {
-    esp_now_send(bindingAddress, (uint8_t *) &nowDataOutput, packetSize); // Send Bind packet with the broadcast address
+    err = (int)esp_now_send(bindingAddress, (uint8_t *) &nowDataOutput, packetSize); // Send Bind packet with the broadcast address
   }
   else
   {
-    esp_now_send(firmwareOptions.uid, (uint8_t *) &nowDataOutput, packetSize);
+    err = (int)esp_now_send(firmwareOptions.uid, (uint8_t *) &nowDataOutput, packetSize);
   }
+#if defined(PLATFORM_ESP32)
+  if (err == 0) {  // ESP_OK on ESP32, 0 on ESP8266
+    espnow_tx_ok++;
+  } else {
+    espnow_tx_fail++;
+    espnow_tx_last_err = (int32_t)err;
+  }
+#else
+  (void)err;
+#endif
 
   blinkLED();
 }

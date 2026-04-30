@@ -32,6 +32,8 @@
 #define MSP_WAYBEAM_SNIFFED_CRSF                0x43
 #define MSP_WAYBEAM_WIRED_CRSF                  0x44 // device -> host: raw CRSF frame from GPIO20 RX
 #define MSP_WAYBEAM_INJECT_CRSF                 0x45 // host -> device: raw CRSF frame to emit on GPIO21 TX
+#define MSP_WAYBEAM_WIRED_CRSF_CTRL             0x46 // host <-> device: enable/disable wired CRSF receiver path
+#define MSP_WAYBEAM_DIAG                        0x47 // host -> device (query): firmware diagnostic counters
 
 // CRSF encapsulated msp defines
 #define ENCAPSULATED_MSP_PAYLOAD_SIZE           4
