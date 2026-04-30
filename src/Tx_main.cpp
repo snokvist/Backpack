@@ -25,6 +25,7 @@
 
 #include "wired_crsf.h"
 #include "oled_dashboard.h"
+#include "passthrough.h"
 
 #if defined(OLED_DASHBOARD) && defined(PLATFORM_ESP32)
   #include <Preferences.h>
@@ -759,11 +760,29 @@ void setup()
 
   devicesInit(ui_devices, ARRAY_SIZE(ui_devices));
 
+#if defined(USB_CRSF_PASSTHROUGH_ENABLED)
+  // Early branch: if NVS says we booted into CRSF passthrough, take over
+  // before ESP-NOW / sniffer / wired-CRSF / OLED-dashboard init. The
+  // passthrough loop owns Serial + UART1 + button polling for the rest
+  // of this boot. Only way out is the ≥3 s BOOT gesture (toggles NVS
+  // and reboots) or power-cycle.
+  if (CrsfPassthroughEnabled())
+  {
+    devicesStart();
+    if (connectionState == starting)
+    {
+      connectionState = running;
+    }
+    runPassthroughForever();
+    // unreachable
+  }
+#endif
+
   #ifdef DEBUG_ELRS_WIFI
     config.SetStartWiFiOnBoot(true);
   #endif
 
-  
+
   if (config.GetStartWiFiOnBoot())
   {
     wifiService = config.GetWiFiService();

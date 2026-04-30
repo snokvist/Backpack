@@ -234,4 +234,91 @@ void OledDashboardLoop(uint32_t now_ms, const OledLinkStats &stats)
   gDisplay.display();
 }
 
+static void DrawPassthroughHeader()
+{
+  gDisplay.fillRect(0, 0, kScreenW, gHeaderH, SSD1306_WHITE);
+  gDisplay.setTextColor(SSD1306_BLACK);
+
+  int16_t textY = (gHeaderH - 8) / 2;
+  if (textY < 0) textY = 0;
+
+  gDisplay.setCursor(2, textY);
+  gDisplay.print(F("CRSF PASSTHRU"));
+
+  const char *baud = "420k 8N1";
+  int16_t x1, y1; uint16_t w, h;
+  gDisplay.getTextBounds(baud, 0, 0, &x1, &y1, &w, &h);
+  gDisplay.setCursor(kScreenW - (int16_t)w - 2, textY);
+  gDisplay.print(baud);
+
+  gDisplay.setTextColor(SSD1306_WHITE);
+}
+
+void OledDashboardPassthroughInit()
+{
+  if (!gReady) return;
+  // Force the very next OledDashboardPassthroughTick() to redraw without
+  // waiting OLED_REFRESH_MS. No placeholder splash here — the tick drawn
+  // ~1 loop iteration later is the user's first visible frame.
+  // gLastRefresh is shared with the normal dashboard's throttle but
+  // OledDashboardLoop is never called concurrently with this path.
+  gLastRefresh = millis() - OLED_REFRESH_MS;
+}
+
+void OledDashboardPassthroughTick(uint32_t now_ms,
+                                  uint32_t usb_to_uart_bytes,
+                                  uint32_t uart_to_usb_bytes,
+                                  uint32_t dropped_to_uart,
+                                  uint32_t dropped_to_usb)
+{
+  if (!gReady) return;
+  if ((now_ms - gLastRefresh) < OLED_REFRESH_MS) return;
+  gLastRefresh = now_ms;
+
+  uint32_t up_s = now_ms / 1000;
+  uint32_t hh = up_s / 3600;
+  uint32_t mm = (up_s / 60) % 60;
+  uint32_t ss = up_s % 60;
+
+  gDisplay.clearDisplay();
+  DrawPassthroughHeader();
+
+  gDisplay.setCursor(0, gRowAY);
+  gDisplay.printf("USB>UART %lu B", (unsigned long)usb_to_uart_bytes);
+  gDisplay.setCursor(0, gRowAY + gLinePitch);
+  gDisplay.printf("UART>USB %lu B", (unsigned long)uart_to_usb_bytes);
+
+  gDisplay.setCursor(0, gRowBY + gLinePitch);
+  gDisplay.printf("up %02lu:%02lu:%02lu",
+                  (unsigned long)hh, (unsigned long)mm, (unsigned long)ss);
+
+  gDisplay.setCursor(0, gRowCY + gLinePitch);
+  if (dropped_to_uart || dropped_to_usb)
+  {
+    // "drop u>U N d>U M" — host-side back-pressure visible at a glance.
+    gDisplay.printf("drop u>U%lu d>U%lu",
+                    (unsigned long)dropped_to_usb,
+                    (unsigned long)dropped_to_uart);
+  }
+  else
+  {
+    gDisplay.print(F("hold BOOT 3s exit"));
+  }
+
+  gDisplay.display();
+}
+
+void OledDashboardSplashCrsfPassthrough(bool enabling)
+{
+  if (!gReady) return;
+  gDisplay.clearDisplay();
+  gDisplay.setTextSize(1);
+  gDisplay.setTextColor(SSD1306_WHITE);
+  gDisplay.setCursor(0, 0);
+  gDisplay.println(F("CRSF PASSTHROUGH"));
+  gDisplay.println(enabling ? F("ON") : F("OFF"));
+  gDisplay.println(F("REBOOTING..."));
+  gDisplay.display();
+}
+
 #endif // OLED_DASHBOARD_ENABLED

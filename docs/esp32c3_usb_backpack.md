@@ -494,3 +494,124 @@ the next dashboard tick (200 ms later) overwrites it with live data.
 - `src/Tx_main.cpp` — broadened host-quiet gate (sniffer + wired share
   it), inject MSP handler, ESP-NOW rate counter, NVS read at boot
 - `CLAUDE.md` — new sections for wired-CRSF + OLED toggle
+
+---
+
+# Follow-up: CRSF passthrough mode
+
+Branch: `feature/crsf-passthrough-mode`. Adds a button-toggleable boot
+mode that turns the device into a transparent USB-CDC ⟷ UART1 (CRSF)
+bridge so a host sees `/dev/ttyACM0` as if plugged directly into an
+ELRS receiver — no MSP, no ESP-NOW, no sniffer. Used for tools that
+speak raw CRSF (Betaflight Configurator, ELRS Lua, `crsf_config`).
+
+## Gestures
+
+| Gesture | Action |
+|---|---|
+| BOOT short press (<500 ms) | Reboot into WiFi update mode (existing) |
+| BOOT long-press 500 ms .. ~3 s, release | OLED layout MONO ↔ DUAL toggle (existing) |
+| BOOT long-press ≥ ~3 s, release | **NEW** — toggle CRSF passthrough + reboot |
+
+All gestures dispatch on **release** via `Button::OnRelease(bool wasLong,
+uint8_t longCount)`. The Button class fires `OnLongPress` repeats at
+0.5 / 1.0 / 1.5 / 2.0 / 2.5 / 3.0 s and increments `longCount` after
+each fire; `longCount >= 5` at release captures the "released after the
+2.5 s tick" case, which is the practical floor for a "≥3 s" hold.
+
+The previous design hooked `OnLongPress` directly and flipped the OLED
+layout mid-hold at 500 ms. With a second long-hold gesture in play that
+flash would happen before the user's intended 3 s gesture completed,
+so dispatch moved to release-based.
+
+## NVS keys (`Preferences` namespace `waybeam_bp`)
+
+| Key | Type | Purpose |
+|---|---|---|
+| `oled_dual` | bool | OLED layout MONO/DUAL (existing) |
+| `crsf_pass` | bool | **NEW** — boot into passthrough mode |
+| `wired_crsf` | bool | wired CRSF bridge enable (irrelevant when `crsf_pass=1`; passthrough loop owns UART1 unconditionally) |
+
+## Boot flow
+
+`Tx_main.cpp::setup()` reads `crsf_pass` after `devicesInit` (so the
+button has its callbacks bound) but before ESP-NOW / sniffer / wired-CRSF
+/ OLED-dashboard init. If set:
+
+1. `devicesStart()` runs (LED + button + WIFI device shells; WiFi stays
+   down because `connectionState != wifiUpdate`).
+2. `runPassthroughForever()` takes over — never returns.
+
+If `crsf_pass=0` (default), normal boot proceeds.
+
+## Pump loop
+
+`runPassthroughForever()` (in `src/passthrough.cpp`):
+
+1. `Serial.begin(420000)` — informational on HWCDC (baud is negotiated
+   at the USB-CDC protocol layer) but mirrors the wire baud so a host
+   that calls `cfgetospeed()` after `tcgetattr()` reads the expected
+   value.
+2. `HardwareSerial(1).begin(420000, SERIAL_8N1, GPIO 20, GPIO 21)`
+   with a 512-byte RX buffer.
+3. `OledDashboardInit(oled_dual) + OledDashboardPassthroughInit()`.
+4. Tight loop: drain `Serial → UART1` and `UART1 → Serial`, poll
+   `Button_device.timeout()` so the ≥3 s gesture can flip the mode
+   back, refresh the OLED at the dashboard's normal 200 ms cadence.
+
+The wired-CRSF MSP wrapping path is **not** initialised in this mode —
+no inject validation, no sliding-window parser, no MSP staging. Bytes
+are forwarded verbatim in both directions.
+
+## OLED layout
+
+Single status frame, refreshed every 200 ms:
+
+```
+┌──────────────────────────────────────┐
+│ CRSF PASSTHRU             420k 8N1   │
+├──────────────────────────────────────┤
+│ USB>UART  1234567 B                  │
+│ UART>USB   234567 B                  │
+│ up 01:23:45                          │
+│ hold BOOT 3s exit                    │
+└──────────────────────────────────────┘
+```
+
+The same `oled_dual` NVS key controls header height and line pitch as
+in the normal dashboard.
+
+## Toggle path
+
+`ToggleCrsfPassthrough()` (called from the BOOT-button release callback,
+both in normal and passthrough mode):
+
+1. Read current `crsf_pass`, flip it, persist to NVS.
+2. `OledDashboardSplashCrsfPassthrough(flipped)` — splash for 1.5 s
+   showing `CRSF PASSTHROUGH / ON or OFF / REBOOTING…`.
+3. `ESP.restart()` — clean state for both modes; the USB host re-
+   enumerates onto the new identity.
+
+## Out of scope
+
+- No mid-mode swap (always reboot). Avoids tearing down a half-parsed
+  MSP frame and lets the host re-enumerate naturally.
+- No host-driven mode toggle via MSP. Button-only by design — the
+  point of passthrough is to look like a non-MSP serial port to the host.
+- No baud-rate negotiation. HWCDC is what it is; if a tool genuinely
+  drives `SetLineCoding` we'd need to mirror that, but no current
+  target tool does.
+
+## Files touched
+
+- `lib/BUTTON/button.h` — add `OnRelease(bool, uint8_t)` callback fired
+  in the `STATE_RISE` branch
+- `lib/BUTTON/devButton.cpp` — replace `OnLongPress` dispatch with
+  `OnRelease`-based dispatch (OLED toggle <3 s, passthrough toggle ≥3 s)
+- `src/passthrough.{h,cpp}` — new — `runPassthroughForever()`,
+  `ToggleCrsfPassthrough()`, `CrsfPassthroughEnabled()`
+- `src/oled_dashboard.{h,cpp}` — `OledDashboardPassthroughInit()`,
+  `OledDashboardPassthroughTick()`, `OledDashboardSplashCrsfPassthrough()`
+- `src/Tx_main.cpp` — early branch in `setup()` to read `crsf_pass` and
+  call `runPassthroughForever()`
+- `CLAUDE.md` — gesture table + passthrough section
