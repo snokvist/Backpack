@@ -183,15 +183,49 @@ firmware can't autodetect; instead the layout (`MONO` 9 px header / 18 px
 rows, or `DUAL` 16 px header / 16 px rows) is selected at boot from
 NVS (`Preferences` namespace `waybeam_bp`, key `oled_dual`).
 
-To flip the layout: **long-press the BOOT button (≥ 500 ms) on a
-running firmware**, release. The splash shows the new mode and writes
-the new value to NVS. One press = one toggle regardless of duration
-(the Button class repeats `OnLongPress` every 500 ms while held; we
-gate on `getLongCount() == 0` so a long hold doesn't cycle).
+Toggling and the full BOOT-button gesture set are described next.
 
 GPIO 9 is the C3's strap pin, so a "hold-during-plug" toggle is **not**
 possible — that path puts the chip in ROM download mode and the
 firmware never runs. Always toggle after boot.
+
+## BOOT button gestures (USB env)
+
+| Gesture | Action |
+|---|---|
+| Short press (<500 ms) | Reboot into WiFi update mode (existing) |
+| Long-press 500 ms .. ~3 s, release | Flip OLED layout MONO ↔ DUAL, persist to NVS |
+| Long-press ≥ ~3 s, release | Toggle CRSF passthrough mode + reboot |
+
+All gestures dispatch on **release** via `Button::OnRelease(wasLong, longCount)`
+in `lib/BUTTON/devButton.cpp`. Long-count thresholds: `OnLongPress` repeats
+fire at 0.5 / 1.0 / 1.5 / 2.0 / 2.5 / 3.0 s, so `longCount >= 5` at release
+captures the ≥3 s gesture (release at 2.5..3.0 s or later).
+
+The previous design hooked `OnLongPress` directly and toggled the layout
+mid-hold at 500 ms. With a second gesture in play that would flash the
+layout once before the user's intended 3 s gesture completed, so the
+dispatch moved to release-based.
+
+## CRSF passthrough mode (USB env)
+
+`crsf_pass=1` in NVS makes the firmware boot into a transparent
+USB-CDC ↔ UART1 bridge: `/dev/ttyACM0` ⟷ GPIO 20 RX / GPIO 21 TX at
+420 000 8N1. The host sees "an ELRS receiver" — useful for tools that
+speak raw CRSF (Configurator, ELRS Lua, `crsf_config`).
+
+The early branch in `Tx_main.cpp::setup()` runs after `devicesInit` (so
+the BOOT button has its callbacks bound) but before ESP-NOW / sniffer /
+wired-CRSF / OLED-dashboard init — those paths stay dormant. The
+passthrough loop owns Serial + UART1 and polls `Button_device.timeout()`
+itself so the user can repeat the ≥3 s gesture to flip back.
+
+OLED in passthrough mode: a single status frame replaces the multi-row
+dashboard. Mono / dual layout is honoured (reads the same `oled_dual`
+NVS key).
+
+Implementation: `src/passthrough.{h,cpp}`. Splash + reboot flow:
+`ToggleCrsfPassthrough()` writes NVS → 1.5 s splash → `ESP.restart()`.
 
 ## Conventions specific to this fork
 

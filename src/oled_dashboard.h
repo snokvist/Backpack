@@ -56,4 +56,22 @@ bool OledDashboardIsDualColor();
 // OledDashboardInit().
 void OledDashboardToggleLayout();
 
+// CRSF passthrough mode. The dashboard's normal multi-row layout is
+// replaced by a single status frame: title + baud, USB→UART / UART→USB
+// byte counters, uptime, exit hint. Init redraws once; Tick is throttled
+// internally to OLED_REFRESH_MS.
+void OledDashboardPassthroughInit();
+// Bottom line shows the BOOT-3s-exit hint when both dropped counters are
+// zero, or "drop u>U N d>U M" (truncated) when non-zero — useful for
+// spotting host-side back-pressure events.
+void OledDashboardPassthroughTick(uint32_t now_ms,
+                                  uint32_t usb_to_uart_bytes,
+                                  uint32_t uart_to_usb_bytes,
+                                  uint32_t dropped_to_uart,
+                                  uint32_t dropped_to_usb);
+
+// Splash shown by ToggleCrsfPassthrough() right before ESP.restart().
+// `enabling=true` → "ON", false → "OFF".
+void OledDashboardSplashCrsfPassthrough(bool enabling);
+
 #endif // OLED_DASHBOARD_ENABLED

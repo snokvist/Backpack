@@ -27,6 +27,11 @@ public:
     // Callbacks
     std::function<void ()>OnShortPress;
     std::function<void ()>OnLongPress;
+    // Fires once on release. wasLongPress=true if the press exceeded
+    // MS_LONG; longCount = number of OnLongPress repeats observed
+    // before release. Lets the consumer distinguish "1 s hold" from
+    // "3 s hold" without flashing a result mid-hold.
+    std::function<void (bool wasLongPress, uint8_t longCount)>OnRelease;
     // Properties
     uint8_t getCount() const { return _pressCount; }
     uint8_t getLongCount() const { return _longCount; }
@@ -53,13 +58,17 @@ public:
         // If rising edge (release)
         if (_state == STATE_RISE)
         {
-            if (!_isLongPress)
+            const bool wasLong = _isLongPress;
+            const uint8_t lc = _longCount;
+            if (!wasLong)
             {
                 DBGLN("Button short");
                 ++_pressCount;
                 if (OnShortPress)
                     OnShortPress();
             }
+            if (OnRelease)
+                OnRelease(wasLong, lc);
             _isLongPress = false;
         }
         // Two low in a row
