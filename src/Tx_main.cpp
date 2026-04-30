@@ -26,6 +26,10 @@
 #include "wired_crsf.h"
 #include "oled_dashboard.h"
 
+#if defined(OLED_DASHBOARD) && defined(PLATFORM_ESP32)
+  #include <Preferences.h>
+#endif
+
 #if defined(MAVLINK_ENABLED)
 #include <MAVLink.h>
 #endif
@@ -817,7 +821,21 @@ void setup()
 #endif
 
 #if defined(OLED_DASHBOARD_ENABLED)
-  OledDashboardInit();
+  // OLED layout selector: read saved `oled_dual` from NVS. Toggle is a
+  // post-boot long-press on the BOOT button (handled in devButton.cpp's
+  // OnLongPress). GPIO 9 is a strap pin on the C3, so a "hold during
+  // plug" toggle would put the chip in ROM download mode instead of
+  // running the firmware — avoid that path.
+  bool oled_dual = false;
+  {
+    Preferences prefs;
+    if (prefs.begin("waybeam_bp", /*read-only=*/true))
+    {
+      oled_dual = prefs.getBool("oled_dual", false);
+      prefs.end();
+    }
+  }
+  OledDashboardInit(oled_dual);
 #endif
 
   DBGLN("Setup completed");

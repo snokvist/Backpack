@@ -19,7 +19,7 @@
   #define USB_WIRED_CRSF_BAUD 420000
 #endif
 #ifndef USB_WIRED_CRSF_MIN_GAP_MS
-  #define USB_WIRED_CRSF_MIN_GAP_MS 15
+  #define USB_WIRED_CRSF_MIN_GAP_MS 5
 #endif
 
 // Max bytes a wrapped MSP frame can produce (wire size). Use this to size

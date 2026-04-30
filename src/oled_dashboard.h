@@ -44,9 +44,16 @@ struct OledLinkStats
   uint8_t        primary_channel;
 };
 
-void OledDashboardInit();
+// dual_color = true for SSD1306 panels with a 16 px yellow band on top.
+// On mono panels it just renders a thicker white header — no harm done.
+void OledDashboardInit(bool dual_color);
 // Call from loop(); internally throttled to OLED_REFRESH_MS.
 void OledDashboardLoop(uint32_t now_ms, const OledLinkStats &stats);
 bool OledDashboardReady();
+bool OledDashboardIsDualColor();
+// Flip the saved layout, re-init the panel, and persist to NVS. Called
+// from the BOOT button long-press callback. Safe to call any time after
+// OledDashboardInit().
+void OledDashboardToggleLayout();
 
 #endif // OLED_DASHBOARD_ENABLED

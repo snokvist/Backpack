@@ -21,10 +21,14 @@ static constexpr size_t  WIRED_MSP_MAX_FRAME  = 3 + 5 + CRSF_MAX_PACKET + 1;
 static HardwareSerial gWiredUart(1);
 static bool gReady = false;
 
-// CRSF byte FSM
-static uint8_t  gFrameBuf[CRSF_MAX_PACKET];
-static uint8_t  gFramePos = 0;
-static uint8_t  gFrameExpected = 0;
+// Sliding-window parser. RX bytes accumulate here; we try to extract a
+// valid frame from the head, and on CRC fail drop one byte and retry —
+// far more resilient than the per-byte FSM that throws away the entire
+// in-flight frame on any CRC mismatch (causing 50–250 Hz to collapse to
+// a few Hz under sustained drift).
+static constexpr size_t WIRED_RX_BUF = CRSF_MAX_PACKET * 2 + 4;
+static uint8_t  gRxBuf[WIRED_RX_BUF];
+static size_t   gRxLen = 0;
 
 // Staged wrapped MSP frame for the main-loop drainer
 static uint8_t  gStageBuf[WIRED_MSP_MAX_FRAME];
@@ -116,19 +120,12 @@ static void StageWrapped(const uint8_t *crsf, size_t crsf_len)
   gStagePending = true;
 }
 
-static void HandleValidFrame(const uint8_t *frame, uint8_t frame_size)
+// Frame: [addr, len, type, payload..., crc]. Already-validated frames
+// only — caller has confirmed CRC over [type..end-1].
+static void EmitValidFrame(const uint8_t *frame, uint8_t frame_size)
 {
-  // frame: [addr, len, type, payload..., crc]
   uint8_t length = frame[1];
   uint8_t type   = frame[2];
-
-  uint8_t expected = crsf_crc(&frame[2], (size_t)(length - 1));
-  uint8_t got      = frame[1 + length];
-  if (expected != got)
-  {
-    gStats.rx_invalid++;
-    return;
-  }
 
   gStats.rx_packets++;
   gStats.last_rx_ms = millis();
@@ -144,39 +141,53 @@ static void HandleValidFrame(const uint8_t *frame, uint8_t frame_size)
   StageWrapped(frame, frame_size);
 }
 
-static void FeedByte(uint8_t b)
+static inline bool IsCrsfAddr(uint8_t a)
 {
-  if (gFramePos == 0)
+  // Common CRSF destinations. Permissive to allow vendor extensions while
+  // still rejecting random byte alignment quickly.
+  return a == 0xC8 || a == 0xEA || a == 0xEC || a == 0xEE;
+}
+
+// Scan from the head of gRxBuf for a valid frame. On CRC mismatch slide
+// the window by one byte and retry (this is the part that recovers from
+// a desync without dropping an entire frame's worth of bytes).
+static void TryParse()
+{
+  while (gRxLen >= 4)
   {
-    // Sync byte (any address). Stock ELRS RX emits 0xC8.
-    gFrameBuf[gFramePos++] = b;
-    return;
-  }
-  if (gFramePos == 1)
-  {
-    if (b < 2 || b > CRSF_MAX_FRAME_LEN)
+    if (!IsCrsfAddr(gRxBuf[0]))
     {
-      gFramePos = 0;
+      memmove(gRxBuf, gRxBuf + 1, --gRxLen);
+      continue;
+    }
+    uint8_t length = gRxBuf[1];
+    if (length < 2 || length > CRSF_MAX_FRAME_LEN)
+    {
+      memmove(gRxBuf, gRxBuf + 1, --gRxLen);
       gStats.rx_invalid++;
+      continue;
+    }
+    size_t total = (size_t)length + 2;
+    if (gRxLen < total)
+    {
+      // Need more bytes — head looks plausible, wait for poll to fill.
       return;
     }
-    gFrameBuf[gFramePos++] = b;
-    gFrameExpected = (uint8_t)(b + 2);
-    return;
-  }
-  if (gFramePos >= sizeof(gFrameBuf))
-  {
-    gFramePos = 0;
-    gFrameExpected = 0;
-    gStats.rx_invalid++;
-    return;
-  }
-  gFrameBuf[gFramePos++] = b;
-  if (gFrameExpected > 0 && gFramePos == gFrameExpected)
-  {
-    HandleValidFrame(gFrameBuf, gFrameExpected);
-    gFramePos = 0;
-    gFrameExpected = 0;
+    uint8_t expected = crsf_crc(&gRxBuf[2], (uint8_t)(length - 1));
+    uint8_t got      = gRxBuf[1 + length];
+    if (expected == got)
+    {
+      EmitValidFrame(gRxBuf, (uint8_t)total);
+      memmove(gRxBuf, gRxBuf + total, gRxLen - total);
+      gRxLen -= total;
+    }
+    else
+    {
+      // Likely false-positive sync. Slide one byte; the real frame
+      // start is probably nearby.
+      memmove(gRxBuf, gRxBuf + 1, --gRxLen);
+      gStats.rx_invalid++;
+    }
   }
 }
 
@@ -186,8 +197,7 @@ void WiredCrsfInit()
   gWiredUart.begin(USB_WIRED_CRSF_BAUD, SERIAL_8N1,
                    USB_WIRED_CRSF_RX_PIN, USB_WIRED_CRSF_TX_PIN);
   gReady = true;
-  gFramePos = 0;
-  gFrameExpected = 0;
+  gRxLen = 0;
   gStagePending = false;
   gStageLen = 0;
   memset(&gStats, 0, sizeof(gStats));
@@ -202,10 +212,18 @@ void WiredCrsfPoll()
   size_t budget = WIRED_RX_BYTES_PER_POLL;
   while (budget-- > 0 && gWiredUart.available() > 0)
   {
+    if (gRxLen >= sizeof(gRxBuf))
+    {
+      // Buffer pressure: drop oldest byte. Should only happen on a
+      // sustained desync; healthy traffic drains via TryParse().
+      memmove(gRxBuf, gRxBuf + 1, --gRxLen);
+      gStats.rx_invalid++;
+    }
     int b = gWiredUart.read();
     if (b < 0) break;
-    FeedByte((uint8_t)b);
+    gRxBuf[gRxLen++] = (uint8_t)b;
   }
+  TryParse();
 
   // Update rolling 1 s rate
   uint32_t now = millis();

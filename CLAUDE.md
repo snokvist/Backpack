@@ -131,11 +131,17 @@ Drainer separation in `loop()`:
 
 - Sniffer slot: 100 ms minimum gap, 500 ms post-host-RX quiet — tuned
   for promiscuous ESP-NOW spam.
-- Wired-CRSF slot: 15 ms minimum gap, same 500 ms post-host-RX quiet —
-  needed to keep 50 Hz RC at usable cadence (≥33 Hz worst case).
+- Wired-CRSF slot: 5 ms minimum gap, same 500 ms post-host-RX quiet —
+  passes 50/100/150/250 Hz RC links without drops (single-slot
+  drop-oldest staging means drainer rate = max emit rate).
 
 Both share the `last_host_rx_ms` quiet gate (the load-bearing rule that
 keeps host-MSP transactions from getting stucked).
+
+Inbound parsing is a sliding-window CRSF parser: on CRC mismatch the
+window slides one byte and retries, so a single byte of drift no
+longer eats the entire next frame. First-byte filter accepts
+`{0xC8, 0xEA, 0xEC, 0xEE}` to drop random alignment quickly.
 
 The wired-CRSF module reuses `GENERIC_CRC8(0xD5)` from `lib/CRC` — same
 polynomial as the canonical CRSF DVB-S2 table; no new CRC table.
@@ -168,6 +174,24 @@ Layout (refreshed every 200 ms from `loop()`):
 Adafruit SSD1306 + GFX libs add ~36 KB flash; only built into
 `ESP32C3_TX_Backpack_via_USB`. Stock UART/ETX/WIFI envs are byte-identical
 to before this PR.
+
+### Mono / dual-color layout toggle
+
+There is no electrical difference between a mono SSD1306 and one with a
+yellow band — the colour is purely a property of the glass. The
+firmware can't autodetect; instead the layout (`MONO` 9 px header / 18 px
+rows, or `DUAL` 16 px header / 16 px rows) is selected at boot from
+NVS (`Preferences` namespace `waybeam_bp`, key `oled_dual`).
+
+To flip the layout: **long-press the BOOT button (≥ 500 ms) on a
+running firmware**, release. The splash shows the new mode and writes
+the new value to NVS. One press = one toggle regardless of duration
+(the Button class repeats `OnLongPress` every 500 ms while held; we
+gate on `getLongCount() == 0` so a long hold doesn't cycle).
+
+GPIO 9 is the C3's strap pin, so a "hold-during-plug" toggle is **not**
+possible — that path puts the chip in ROM download mode and the
+firmware never runs. Always toggle after boot.
 
 ## Conventions specific to this fork
 

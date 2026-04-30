@@ -365,3 +365,132 @@ These are *not* implemented yet — pick whichever is needed:
 ## Branch
 
 `fix/sniffer-throttle-c3-usb-cdc` (PR #3).
+
+---
+
+# Follow-up: wired CRSF bridge + OLED dashboard (PR #8)
+
+Branch: `feature/usb-wired-crsf-bridge`. Two orthogonal features on top
+of the sniffer baseline.
+
+## 1. Wired CRSF bridge (UART1 ↔ USB-CDC)
+
+Standard CRSF UART on **GPIO 20 (RX) / GPIO 21 (TX) at 420 000 8N1**.
+Multiplexes RC channel data and telemetry inject onto the same
+USB-CDC stream that already carries MSP. Either pin may be left
+disconnected.
+
+### Wire format
+
+| MSP function | Direction | Payload |
+|---|---|---|
+| `MSP_WAYBEAM_WIRED_CRSF` (`0x0044`) | device → host | full CRSF frame: `addr (1) | len (1) | type (1) | crsf_payload (N) | crc8_dvb (1)` |
+| `MSP_WAYBEAM_INJECT_CRSF` (`0x0045`) | host → device | full CRSF frame; firmware re-validates CRC before emitting on UART1 TX |
+
+All frame types forwarded verbatim — RC channels (`0x16`), link
+statistics (`0x14`), telemetry (`0x02 / 0x07 / 0x08 / 0x1E / 0x21`),
+MSP-encapsulated (`0x7A / 0x7B`). The host dispatches by frame type.
+
+### Drainer pacing
+
+| Stream | Min-gap | Max emit rate |
+|---|---|---|
+| Sniffer (`0x0043`) | `USB_SNIFFER_MIN_GAP_MS = 100 ms` | 10 Hz |
+| Wired CRSF (`0x0044`) | `USB_WIRED_CRSF_MIN_GAP_MS = 5 ms` | 200 Hz |
+
+Both honour `last_host_rx_ms` (500 ms post-host-RX quiet) so a host MSP
+transaction is never disrupted. Single-slot drop-oldest staging:
+drainer rate = max emit rate. With 5 ms gap the wired path passes
+50 / 100 / 150 / 250 Hz CRSF link rates without drops. 500 Hz needs
+2 ms — override `USB_WIRED_CRSF_MIN_GAP_MS` per env if needed.
+
+### Sliding-window parser
+
+`src/wired_crsf.cpp` accumulates UART bytes in a 136-byte window. Each
+poll:
+
+1. Drop bytes from the head until `gRxBuf[0]` is a known CRSF address
+   (`0xC8 / 0xEA / 0xEC / 0xEE`).
+2. Validate `length` ∈ `[2, 64]`.
+3. Wait for `length + 2` bytes.
+4. Validate CRC8-DVB-S2 over `[type .. last-1]`.
+5. On match: emit, slide past the frame, repeat.
+6. On CRC fail: slide one byte and retry.
+
+The previous per-byte FSM threw away the entire in-flight frame on any
+CRC fail; under sustained drift that collapsed 250 Hz traffic to ~3 Hz.
+Sliding by one byte recovers in ≤4 byte slides.
+
+### CRC reuse — protocol invariant
+
+CRC8-DVB-S2 (poly `0xD5`) is computed via `GENERIC_CRC8(0xD5)` from
+`lib/CRC` — the same instance type used by the sniffer's MSP wrapper.
+No new CRC table introduced. Frames are forwarded verbatim, so the
+4-implementation drift list at `protocols/crsf-rc.md` (in the
+coordination repo) stays at 4.
+
+### Inject path
+
+`MSP_WAYBEAM_INJECT_CRSF` (`0x0045`) handler in `ProcessMSPPacketFromTX`
+calls `WiredCrsfInjectFromHost(payload, size)`:
+
+1. Bounds-checks `size` (`[4, 66]`).
+2. Validates length consistency: `payload[1] + 2 == size`.
+3. Re-validates CRC8 (so a malformed host frame can never blast garbage
+   onto the receiver UART).
+4. Writes the verbatim bytes via `Serial1.write()` (UART1 TX = GPIO 21).
+
+Counters: `tx_packets`, `tx_dropped`.
+
+## 2. OLED status dashboard
+
+Optional 128 × 64 SSD1306 on **I²C: SDA = GPIO 4, SCL = GPIO 5, addr 0x3C**.
+Init failure (no panel soldered) silently disables the dashboard.
+
+Refreshed every 200 ms from `loop()` (same task as the host MSP RX, so
+no race against `Serial.read`). Three rows: ESP-NOW peer state, wired
+CRSF state, host channel state.
+
+### Mono / dual-color layout
+
+A dual-color SSD1306 has the top 16 px in yellow, bottom 48 px in blue;
+electrically identical to the mono variant. There's no register or
+strap that exposes which glass is fitted, so autodetect is impossible.
+The firmware persists the choice in NVS (`Preferences` namespace
+`waybeam_bp`, key `oled_dual`).
+
+| Layout | Header | Row 1 / 2 / 3 first-line Y | Line pitch |
+|---|---|---|---|
+| `MONO`  | 9 px white  | 11 / 29 / 47 | 9 px |
+| `DUAL`  | 16 px white | 16 / 32 / 48 | 8 px |
+
+DUAL rows butt against the header — on yellow-band glass the colour
+change at `y = 16` is the visual separator. Last line ends at `y = 63`
+in both layouts.
+
+### Toggle mechanism
+
+GPIO 9 (`PIN_BUTTON`) doubles as the C3's BOOT strap pin. Holding it
+during reset puts the chip in ROM download mode, so a "hold-during-plug"
+toggle never sees the firmware run. We hook **post-boot long-press
+(≥ 500 ms)** instead, via `Button::OnLongPress` in
+`lib/BUTTON/devButton.cpp`. The callback is gated on
+`button.getLongCount() == 0` so a 1.5 s hold flips once, not three
+times (the Button class re-fires `OnLongPress` every 500 ms while held).
+
+A brief splash (`layout: MONO` or `layout: DUAL`) confirms each toggle;
+the next dashboard tick (200 ms later) overwrites it with live data.
+
+## Files touched (PR #8)
+
+- `lib/MSP/msptypes.h` — `MSP_WAYBEAM_WIRED_CRSF (0x0044)`,
+  `MSP_WAYBEAM_INJECT_CRSF (0x0045)`
+- `targets/txbp_esp.ini` — `USB_WIRED_CRSF*` and `OLED_*` flags,
+  `Adafruit SSD1306 + GFX` libs (USB env only)
+- `src/wired_crsf.{h,cpp}` — sliding-window parser, MSP wrapper, inject
+- `src/oled_dashboard.{h,cpp}` — 128 × 64 SSD1306 dashboard, mono / dual
+  layout, runtime toggle persistence
+- `lib/BUTTON/devButton.cpp` — `OnLongPress` → OLED layout toggle
+- `src/Tx_main.cpp` — broadened host-quiet gate (sniffer + wired share
+  it), inject MSP handler, ESP-NOW rate counter, NVS read at boot
+- `CLAUDE.md` — new sections for wired-CRSF + OLED toggle
