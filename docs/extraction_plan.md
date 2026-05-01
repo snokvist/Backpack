@@ -1,5 +1,17 @@
 # Extraction plan — `ESP32C3_TX_Backpack_via_USB` → standalone project
 
+> **Status (2026-05-01):** Phases 0-3 of Option A executed. Standalone
+> project lives at
+> [`snokvist/esp32-supermini-projects` → `projects/tx-backpack-usb/`](https://github.com/snokvist/esp32-supermini-projects/tree/feature/tx-backpack-usb-extract/projects/tx-backpack-usb)
+> via [esp32-supermini-projects PR #24](https://github.com/snokvist/esp32-supermini-projects/pull/24).
+> Extracted from `snokvist/Backpack@4b2fd92`. Phases 4-5 (further build-flag
+> cleanup, release tag, deprecating the USB env in this repo) are deferred —
+> open a follow-up PR when needed.
+>
+> This document is preserved as historical record; do not treat it as the
+> live source of truth for the extracted project's structure (the project's
+> own `README.md` is).
+
 This document captures the inventory of what the USB TX backpack env actually
 compiles in, and a step-by-step plan to extract it into a standalone PlatformIO
 project under the `esp32-supermini-` projects repo.
